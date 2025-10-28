@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
+const axios = require('axios');
 const port = process.env.PORT || 3000;
 const app = express();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
@@ -18,7 +19,17 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-const FormData = require('form-data');
+app.use(express.json({ 
+  limit: '50mb', // Increase from default 100kb to 50mb
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+app.use(express.urlencoded({ 
+  extended: true, 
+  limit: '50mb' // Increase from default 100kb to 50mb
+}));
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -84,9 +95,10 @@ function VerifyToken(req, res, next) {
     next();
   });
 }
+
+
 app.post("/upload", VerifyToken, async (req, res) => {
   try {
-    // For base64 images sent in request body
     const { image } = req.body;
 
     if (!image) {
@@ -96,11 +108,33 @@ app.post("/upload", VerifyToken, async (req, res) => {
       });
     }
 
+    console.log("Received image upload request");
+
+    // Validate that it's a base64 image
+    if (!image.startsWith('data:image/')) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid image format. Expected base64 image data."
+      });
+    }
+
+    // Extract base64 data
+    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+    
+    // Validate image size
+    const imageSizeInBytes = (base64Data.length * 3) / 4;
+    if (imageSizeInBytes > 10 * 1024 * 1024) {
+      return res.status(413).send({
+        success: false,
+        message: "Image too large. Maximum size is 10MB."
+      });
+    }
+
     console.log("Uploading image to imgBB...");
 
-    // Upload to imgBB - they expect form-data with base64 string
+    // Upload to imgBB
     const formData = new URLSearchParams();
-    formData.append('image', image); // imgBB expects base64 string
+    formData.append('image', base64Data);
     
     const imgBBResponse = await axios.post(
       `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
@@ -109,6 +143,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
+        timeout: 30000
       }
     );
 
@@ -120,7 +155,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
       res.status(200).send({
         success: true,
         message: "Image uploaded successfully",
-        imageUrl: imageUrl,
+        url: imageUrl, // Changed from imageUrl to url to match frontend expectation
         imgBBData: imgBBResponse.data.data
       });
     } else {
@@ -128,6 +163,13 @@ app.post("/upload", VerifyToken, async (req, res) => {
     }
   } catch (error) {
     console.error("Error uploading image to imgBB:", error);
+    
+    if (error.code === 'ECONNABORTED') {
+      return res.status(408).send({
+        success: false,
+        message: "Image upload timeout. Please try again."
+      });
+    }
     
     if (error.response) {
       res.status(error.response.status).send({
@@ -144,6 +186,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
     }
   }
 });
+
 
     app.post("/logout", VerifyToken, (req, res) => {
       res.clearCookie("token");
@@ -399,7 +442,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
     });
 
     // Post APIs
- app.post("/posts", VerifyToken, async (req, res) => {
+app.post("/posts", VerifyToken, async (req, res) => {
   try {
     const { content, image, privacy = "public" } = req.body;
     const userId = req.user.userId;
@@ -420,25 +463,32 @@ app.post("/upload", VerifyToken, async (req, res) => {
       console.log("Detected base64 image, uploading to imgBB...");
       
       try {
-        const uploadResponse = await axios.post(
-          `http://localhost:${port}/upload-base64`,
-          { image },
+        // Upload directly to imgBB instead of internal endpoint
+        const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
+        
+        const formData = new URLSearchParams();
+        formData.append('image', base64Data);
+        
+        const imgBBResponse = await axios.post(
+          `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+          formData,
           {
             headers: {
-              'Authorization': req.headers.authorization,
-              'Content-Type': 'application/json'
-            }
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            timeout: 30000
           }
         );
 
-        if (uploadResponse.data.success) {
-          imageUrl = uploadResponse.data.imageUrl;
+        if (imgBBResponse.data.success) {
+          const imgBBData = imgBBResponse.data.data;
+          imageUrl = imgBBData.url;
           imageData = {
-            url: uploadResponse.data.imageUrl,
-            thumbUrl: uploadResponse.data.thumbUrl,
-            mediumUrl: uploadResponse.data.mediumUrl,
-            deleteUrl: uploadResponse.data.deleteUrl,
-            imageId: uploadResponse.data.imageId
+            url: imgBBData.url,
+            thumbUrl: imgBBData.thumb?.url || imgBBData.url,
+            mediumUrl: imgBBData.medium?.url || imgBBData.url,
+            deleteUrl: imgBBData.delete_url,
+            imageId: imgBBData.id
           };
           console.log("Image uploaded successfully:", imageUrl);
         }
@@ -455,7 +505,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
       userId: new ObjectId(userId),
       content: content || "",
       image: imageUrl,
-      imageData: imageData, // Store additional image metadata
+      imageData: imageData,
       privacy,
       likes: [],
       comments: [],
@@ -508,6 +558,16 @@ app.post("/upload", VerifyToken, async (req, res) => {
     });
   }
 });
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Server is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
 
 // Get posts with image support
 app.get("/posts", VerifyToken, async (req, res) => {
