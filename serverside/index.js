@@ -1,36 +1,49 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
-const axios = require('axios');
+const axios = require("axios");
 const port = process.env.PORT || 3000;
 const app = express();
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
-
 const jwt = require("jsonwebtoken");
+const http = require('http');
+const { Server } = require('socket.io');
+
+// Create HTTP server and Socket.IO instance
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: ["http://localhost:8081"],
+    credentials: true,
+    methods: ["GET", "POST"]
+  }
+});
+
+// Middleware
 app.use(
   cors({
-    origin: [
-      "http://localhost:8081",
-    ],
+    origin: ["http://localhost:8081"],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.use(express.json({ 
-  limit: '50mb', // Increase from default 100kb to 50mb
-  verify: (req, res, buf) => {
-    req.rawBody = buf;
-  }
-}));
-app.use(express.urlencoded({ 
-  extended: true, 
-  limit: '50mb' // Increase from default 100kb to 50mb
-}));
-
-app.use(express.json());
+app.use(
+  express.json({
+    limit: "50mb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "50mb",
+  })
+);
 app.use(cookieParser());
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.5iz2xl.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
@@ -43,25 +56,969 @@ const client = new MongoClient(uri, {
   },
 });
 
-// Database collections
-let usersCollection, postsCollection, storiesCollection, friendsCollection;
+// Store active users and their socket connections
+const activeUsers = new Map(); // userId -> socketId
+const userSockets = new Map(); // socketId -> userId
+
+let usersCollection, postsCollection, storiesCollection, friendsCollection, notificationsCollection, conversationsCollection, messagesCollection;
+
+// Notification Types
+const NOTIFICATION_TYPES = {
+  POST_LIKE: 'post_like',
+  POST_COMMENT: 'post_comment',
+  COMMENT_REPLY: 'comment_reply',
+  POST_SHARE: 'post_share',
+  FRIEND_REQUEST: 'friend_request',
+  FRIEND_REQUEST_ACCEPTED: 'friend_request_accepted',
+  MENTION: 'mention',
+  TAG: 'tag'
+};
+
+// Enhanced Create a notification (utility function) with WebSocket support
+async function createNotification(notificationData) {
+  try {
+    const notification = {
+      ...notificationData,
+      isRead: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    
+    const result = await notificationsCollection.insertOne(notification);
+    const insertedId = result.insertedId;
+
+    // Get the complete notification with populated data
+    const completeNotification = await notificationsCollection.aggregate([
+      { $match: { _id: insertedId } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "senderId",
+          foreignField: "_id",
+          as: "sender",
+        },
+      },
+      { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          "sender.password": 0,
+          "sender.email": 0,
+        },
+      },
+    ]).next();
+
+    // Emit real-time notification via WebSocket to the recipient
+    const recipientId = notificationData.recipientId.toString();
+    
+    // Check if recipient is online
+    const isRecipientOnline = activeUsers.has(recipientId);
+    
+    if (isRecipientOnline) {
+      io.to(recipientId).emit('new_notification', {
+        notification: completeNotification
+      });
+
+      // Also update unread count in real-time
+      const unreadCount = await notificationsCollection.countDocuments({
+        recipientId: new ObjectId(recipientId),
+        isRead: false,
+      });
+
+      io.to(recipientId).emit('unread_count_updated', {
+        unreadCount
+      });
+    }
+
+    // Also emit to specific notifications room
+    io.to(`notifications_${recipientId}`).emit('notification_created', {
+      notification: completeNotification
+    });
+
+    console.log(`Notification sent to user ${recipientId}, online: ${isRecipientOnline}`);
+    
+    return insertedId;
+  } catch (error) {
+    console.error("Error creating notification:", error);
+    return null;
+  }
+}
+
+// Enhanced createNotification function for post interactions
+async function createPostInteractionNotification(interactionData) {
+  const {
+    type,
+    postId,
+    commentId,
+    replyId,
+    senderId,
+    recipientId,
+    content,
+    metadata = {}
+  } = interactionData;
+
+  // Don't create notification if user is interacting with their own content
+  if (senderId.toString() === recipientId.toString()) {
+    return null;
+  }
+
+  let message = '';
+  let notificationType = type;
+
+  switch (type) {
+    case NOTIFICATION_TYPES.POST_LIKE:
+      message = 'liked your post';
+      break;
+    case NOTIFICATION_TYPES.POST_COMMENT:
+      message = 'commented on your post';
+      break;
+    case NOTIFICATION_TYPES.COMMENT_REPLY:
+      message = 'replied to your comment';
+      break;
+    case NOTIFICATION_TYPES.POST_SHARE:
+      message = 'shared your post';
+      break;
+    default:
+      message = 'interacted with your content';
+  }
+
+  const notificationData = {
+    type: notificationType,
+    senderId: new ObjectId(senderId),
+    recipientId: new ObjectId(recipientId),
+    message,
+    metadata: {
+      postId: new ObjectId(postId),
+      ...metadata
+    },
+    isRead: false,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+
+  // Add comment/reply IDs if applicable
+  if (commentId) {
+    notificationData.metadata.commentId = new ObjectId(commentId);
+  }
+  if (replyId) {
+    notificationData.metadata.replyId = new ObjectId(replyId);
+  }
+
+  // Add content preview (truncated)
+  if (content) {
+    notificationData.metadata.contentPreview = content.length > 100 
+      ? content.substring(0, 100) + '...' 
+      : content;
+  }
+
+  return await createNotification(notificationData);
+}
+
+// Socket.IO authentication middleware
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  
+  if (!token) {
+    return next(new Error("Authentication error: No token provided"));
+  }
+
+  jwt.verify(token, process.env.ACCESS_TOKEN, (err, decoded) => {
+    if (err) {
+      return next(new Error("Authentication error: Invalid token"));
+    }
+    socket.userId = decoded.userId;
+    next();
+  });
+});
+
+// Initialize WebSocket handlers after database connection
+function initializeWebSocketHandlers() {
+  io.on('connection', (socket) => {
+    console.log('User connected:', socket.userId, 'Socket ID:', socket.id);
+
+    // Store user connection
+    activeUsers.set(socket.userId, socket.id);
+    userSockets.set(socket.id, socket.userId);
+
+    // Join user to their personal room for notifications
+    socket.join(socket.userId);
+    socket.join(`notifications_${socket.userId}`); // Specific notifications room
+
+    // Join all user's conversation rooms
+    const joinUserConversations = async () => {
+      try {
+        const conversations = await conversationsCollection.find({
+          participants: new ObjectId(socket.userId)
+        }).toArray();
+
+        conversations.forEach(conversation => {
+          socket.join(conversation._id.toString());
+          console.log(`User ${socket.userId} joined conversation ${conversation._id}`);
+        });
+      } catch (error) {
+        console.error('Error joining conversations:', error);
+      }
+    };
+
+    joinUserConversations();
+
+    // **NOTIFICATION WEB SOCKET EVENTS**
+
+    // Mark notification as read via WebSocket
+    socket.on('mark_notification_read', async (data) => {
+      try {
+        const { notificationId } = data;
+        
+        const result = await notificationsCollection.updateOne(
+          {
+            _id: new ObjectId(notificationId),
+            recipientId: new ObjectId(socket.userId),
+          },
+          { $set: { isRead: true, readAt: new Date() } }
+        );
+
+        if (result.modifiedCount > 0) {
+          // Notify the user that notification was marked as read
+          socket.emit('notification_marked_read', {
+            notificationId,
+            success: true
+          });
+
+          // Update unread count for all user's devices
+          const unreadCount = await notificationsCollection.countDocuments({
+            recipientId: new ObjectId(socket.userId),
+            isRead: false,
+          });
+
+          io.to(socket.userId).emit('unread_count_updated', {
+            unreadCount
+          });
+        }
+      } catch (error) {
+        console.error('Error marking notification as read via WebSocket:', error);
+        socket.emit('notification_error', {
+          error: 'Failed to mark notification as read'
+        });
+      }
+    });
+
+    // Post interaction WebSocket events
+    socket.on('post_liked', async (data) => {
+      try {
+        const { postId, userId } = data;
+        
+        // Notify post owner in real-time
+        const post = await postsCollection.findOne(
+          { _id: new ObjectId(postId) },
+          { projection: { userId: 1 } }
+        );
+
+        if (post && post.userId.toString() !== userId) {
+          socket.to(post.userId.toString()).emit('post_like_notification', {
+            postId,
+            likedBy: userId,
+            timestamp: new Date()
+          });
+        }
+      } catch (error) {
+        console.error('Error handling post_liked event:', error);
+      }
+    });
+
+    socket.on('comment_added', async (data) => {
+      try {
+        const { postId, commentId, userId } = data;
+        
+        // Notify post owner or comment owner in real-time
+        const post = await postsCollection.findOne(
+          { _id: new ObjectId(postId) },
+          { projection: { userId: 1, comments: 1 } }
+        );
+
+        if (post) {
+          const comment = post.comments.find(c => c._id.toString() === commentId);
+          if (comment) {
+            const recipientId = comment.parentCommentId 
+              ? (await getParentCommentAuthor(postId, comment.parentCommentId))
+              : post.userId.toString();
+
+            if (recipientId && recipientId !== userId) {
+              socket.to(recipientId).emit('comment_notification', {
+                postId,
+                commentId,
+                commentedBy: userId,
+                isReply: !!comment.parentCommentId,
+                timestamp: new Date()
+              });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error handling comment_added event:', error);
+      }
+    });
+
+    // Helper function to get parent comment author
+    async function getParentCommentAuthor(postId, parentCommentId) {
+      try {
+        const post = await postsCollection.findOne(
+          { 
+            _id: new ObjectId(postId),
+            "comments._id": new ObjectId(parentCommentId)
+          },
+          { projection: { "comments.$": 1 } }
+        );
+        
+        return post && post.comments.length > 0 
+          ? post.comments[0].userId.toString() 
+          : null;
+      } catch (error) {
+        console.error('Error getting parent comment author:', error);
+        return null;
+      }
+    }
+
+    // Mark all notifications as read via WebSocket
+    socket.on('mark_all_notifications_read', async () => {
+      try {
+        const result = await notificationsCollection.updateMany(
+          {
+            recipientId: new ObjectId(socket.userId),
+            isRead: false,
+          },
+          { $set: { isRead: true, readAt: new Date() } }
+        );
+
+        socket.emit('all_notifications_marked_read', {
+          success: true,
+          markedCount: result.modifiedCount
+        });
+
+        // Update unread count
+        io.to(socket.userId).emit('unread_count_updated', {
+          unreadCount: 0
+        });
+
+      } catch (error) {
+        console.error('Error marking all notifications as read via WebSocket:', error);
+        socket.emit('notification_error', {
+          error: 'Failed to mark all notifications as read'
+        });
+      }
+    });
+
+    // Subscribe to real-time notifications
+    socket.on('subscribe_notifications', () => {
+      console.log(`User ${socket.userId} subscribed to real-time notifications`);
+      // User is already joined to their notification room
+    });
+
+    // Unsubscribe from notifications (optional)
+    socket.on('unsubscribe_notifications', () => {
+      socket.leave(`notifications_${socket.userId}`);
+    });
+
+    // Request current unread count
+    socket.on('get_unread_count', async () => {
+      try {
+        const unreadCount = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(socket.userId),
+          isRead: false,
+        });
+
+        socket.emit('unread_count', {
+          unreadCount
+        });
+      } catch (error) {
+        console.error('Error getting unread count via WebSocket:', error);
+      }
+    });
+
+    // Delete notification via WebSocket
+    socket.on('delete_notification', async (data) => {
+      try {
+        const { notificationId } = data;
+        
+        const result = await notificationsCollection.deleteOne({
+          _id: new ObjectId(notificationId),
+          recipientId: new ObjectId(socket.userId),
+        });
+
+        if (result.deletedCount > 0) {
+          socket.emit('notification_deleted', {
+            notificationId,
+            success: true
+          });
+
+          // Update unread count
+          const unreadCount = await notificationsCollection.countDocuments({
+            recipientId: new ObjectId(socket.userId),
+            isRead: false,
+          });
+
+          io.to(socket.userId).emit('unread_count_updated', {
+            unreadCount
+          });
+        }
+      } catch (error) {
+        console.error('Error deleting notification via WebSocket:', error);
+        socket.emit('notification_error', {
+          error: 'Failed to delete notification'
+        });
+      }
+    });
+
+    // Handle typing events
+    socket.on('typing_start', (data) => {
+      const { conversationId } = data;
+      socket.to(conversationId).emit('user_typing', {
+        userId: socket.userId,
+        conversationId,
+        isTyping: true
+      });
+    });
+
+    socket.on('typing_stop', (data) => {
+      const { conversationId } = data;
+      socket.to(conversationId).emit('user_typing', {
+        userId: socket.userId,
+        conversationId,
+        isTyping: false
+      });
+    });
+
+    // Handle message read events
+    socket.on('mark_messages_read', async (data) => {
+      try {
+        const { conversationId } = data;
+        
+        // Mark all messages in conversation as read by this user
+        await messagesCollection.updateMany(
+          {
+            conversationId: new ObjectId(conversationId),
+            senderId: { $ne: new ObjectId(socket.userId) },
+            readBy: { $ne: new ObjectId(socket.userId) }
+          },
+          {
+            $push: { readBy: new ObjectId(socket.userId) }
+          }
+        );
+
+        // Reset unread count for this user
+        await conversationsCollection.updateOne(
+          {
+            _id: new ObjectId(conversationId),
+            "unreadCounts.userId": new ObjectId(socket.userId)
+          },
+          {
+            $set: { "unreadCounts.$.count": 0 }
+          }
+        );
+
+        // Notify other participants that messages were read
+        socket.to(conversationId).emit('messages_read', {
+          conversationId,
+          readBy: socket.userId,
+          readAt: new Date()
+        });
+
+      } catch (error) {
+        console.error('Error marking messages as read:', error);
+      }
+    });
+
+    // Handle user online status
+    socket.on('user_online', () => {
+      socket.broadcast.emit('user_status_change', {
+        userId: socket.userId,
+        isOnline: true,
+        lastSeen: new Date()
+      });
+    });
+
+    // Handle disconnect
+    socket.on('disconnect', () => {
+      console.log('User disconnected:', socket.userId);
+      
+      activeUsers.delete(socket.userId);
+      userSockets.delete(socket.id);
+
+      // Notify others that user went offline
+      socket.broadcast.emit('user_status_change', {
+        userId: socket.userId,
+        isOnline: false,
+        lastSeen: new Date()
+      });
+    });
+  });
+}
+
+// Utility function to get unread counts
+async function getUnreadCounts(conversationId) {
+  const conversation = await conversationsCollection.findOne(
+    { _id: new ObjectId(conversationId) },
+    { projection: { unreadCounts: 1 } }
+  );
+  return conversation?.unreadCounts || [];
+}
+
+// Utility function to emit to specific user
+function emitToUser(userId, event, data) {
+  const socketId = activeUsers.get(userId);
+  if (socketId) {
+    io.to(socketId).emit(event, data);
+  }
+}
 
 async function run() {
   try {
     await client.connect();
-    
+
     const database = client.db("social_media");
     usersCollection = database.collection("users");
     postsCollection = database.collection("posts");
     storiesCollection = database.collection("stories");
     friendsCollection = database.collection("friends");
+    notificationsCollection = database.collection("notifications");
+    conversationsCollection = database.collection("conversations");
+    messagesCollection = database.collection("messages");
 
-    console.log("Connected to MongoDB");
+    console.log("Database collections initialized successfully");
 
+    // Initialize WebSocket handlers after collections are ready
+    initializeWebSocketHandlers();
 
+    // Enhanced Notification APIs
 
-    // JWT Authentication
-app.post("/jwt", async (req, res) => {
+    // Get all notifications for current user with better filtering
+    app.get("/notifications", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { 
+          page = 1, 
+          limit = 20, 
+          unreadOnly = false,
+          type 
+        } = req.query;
+        
+        const skip = (page - 1) * parseInt(limit);
+
+        // Build query
+        const query = { recipientId: new ObjectId(userId) };
+        
+        if (unreadOnly === "true") {
+          query.isRead = false;
+        }
+        
+        if (type && type !== 'all') {
+          query.type = type;
+        }
+
+        const notifications = await notificationsCollection
+          .aggregate([
+            { $match: query },
+            {
+              $lookup: {
+                from: "users",
+                localField: "senderId",
+                foreignField: "_id",
+                as: "sender",
+              },
+            },
+            { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+            {
+              $project: {
+                "sender.password": 0,
+                "sender.email": 0,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: parseInt(limit) },
+          ])
+          .toArray();
+
+        // Get unread count for each type
+        const unreadCounts = await notificationsCollection.aggregate([
+          {
+            $match: {
+              recipientId: new ObjectId(userId),
+              isRead: false
+            }
+          },
+          {
+            $group: {
+              _id: "$type",
+              count: { $sum: 1 }
+            }
+          }
+        ]).toArray();
+
+        const totalUnread = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        res.send({
+          success: true,
+          notifications,
+          unreadCount: totalUnread,
+          unreadCounts: unreadCounts.reduce((acc, item) => {
+            acc[item._id] = item.count;
+            return acc;
+          }, {}),
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: await notificationsCollection.countDocuments({
+              recipientId: new ObjectId(userId),
+            }),
+          },
+          realTimeEnabled: true,
+          websocketEvents: [
+            'new_notification',
+            'notification_marked_read',
+            'all_notifications_marked_read',
+            'unread_count_updated',
+            'notification_deleted'
+          ]
+        });
+      } catch (error) {
+        console.error("Error fetching notifications:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while fetching notifications",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get notification statistics with real-time updates
+    app.get("/notifications/stats", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const stats = await notificationsCollection.aggregate([
+          {
+            $match: {
+              recipientId: new ObjectId(userId)
+            }
+          },
+          {
+            $group: {
+              _id: "$type",
+              total: { $sum: 1 },
+              unread: {
+                $sum: {
+                  $cond: [{ $eq: ["$isRead", false] }, 1, 0]
+                }
+              }
+            }
+          }
+        ]).toArray();
+
+        const totalUnread = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        res.send({
+          success: true,
+          stats: stats.reduce((acc, item) => {
+            acc[item._id] = item;
+            return acc;
+          }, {}),
+          totalUnread
+        });
+      } catch (error) {
+        console.error("Error fetching notification stats:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get notifications with real-time capabilities
+    app.get("/notifications/real-time", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { limit = 20 } = req.query;
+
+        const notifications = await notificationsCollection
+          .aggregate([
+            { $match: { recipientId: new ObjectId(userId) } },
+            {
+              $lookup: {
+                from: "users",
+                localField: "senderId",
+                foreignField: "_id",
+                as: "sender",
+              },
+            },
+            { $unwind: { path: "$sender", preserveNullAndEmptyArrays: true } },
+            {
+              $project: {
+                "sender.password": 0,
+                "sender.email": 0,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+            { $limit: parseInt(limit) },
+          ])
+          .toArray();
+
+        const unreadCount = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        res.send({
+          success: true,
+          notifications,
+          unreadCount,
+          realTimeEnabled: true,
+          websocketEvents: [
+            'new_notification',
+            'notification_marked_read',
+            'all_notifications_marked_read',
+            'unread_count_updated',
+            'notification_deleted'
+          ]
+        });
+      } catch (error) {
+        console.error("Error fetching real-time notifications:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while fetching notifications",
+          error: error.message,
+        });
+      }
+    });
+
+    // Mark notification as read
+    app.put("/notifications/:id/read", VerifyToken, async (req, res) => {
+      try {
+        const notificationId = req.params.id;
+        const userId = req.user.userId;
+
+        const result = await notificationsCollection.updateOne(
+          {
+            _id: new ObjectId(notificationId),
+            recipientId: new ObjectId(userId),
+          },
+          { $set: { isRead: true, readAt: new Date() } }
+        );
+
+        if (result.modifiedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: "Notification not found or unauthorized",
+          });
+        }
+
+        // Emit WebSocket event for real-time update
+        const unreadCount = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        io.to(userId).emit('unread_count_updated', {
+          unreadCount
+        });
+
+        res.send({
+          success: true,
+          message: "Notification marked as read",
+        });
+      } catch (error) {
+        console.error("Error marking notification as read:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Mark all notifications as read
+    app.put("/notifications/read-all", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const result = await notificationsCollection.updateMany(
+          {
+            recipientId: new ObjectId(userId),
+            isRead: false,
+          },
+          { $set: { isRead: true, readAt: new Date() } }
+        );
+
+        // Emit WebSocket event for real-time update
+        io.to(userId).emit('unread_count_updated', {
+          unreadCount: 0
+        });
+
+        res.send({
+          success: true,
+          message: `Marked ${result.modifiedCount} notifications as read`,
+          markedCount: result.modifiedCount,
+        });
+      } catch (error) {
+        console.error("Error marking all notifications as read:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Delete a notification
+    app.delete("/notifications/:id", VerifyToken, async (req, res) => {
+      try {
+        const notificationId = req.params.id;
+        const userId = req.user.userId;
+
+        const result = await notificationsCollection.deleteOne({
+          _id: new ObjectId(notificationId),
+          recipientId: new ObjectId(userId),
+        });
+
+        if (result.deletedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: "Notification not found or unauthorized",
+          });
+        }
+
+        // Update unread count via WebSocket
+        const unreadCount = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        io.to(userId).emit('unread_count_updated', {
+          unreadCount
+        });
+
+        res.send({
+          success: true,
+          message: "Notification deleted successfully",
+        });
+      } catch (error) {
+        console.error("Error deleting notification:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Clear all notifications
+    app.delete("/notifications", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const result = await notificationsCollection.deleteMany({
+          recipientId: new ObjectId(userId),
+        });
+
+        // Emit WebSocket event for real-time update
+        io.to(userId).emit('unread_count_updated', {
+          unreadCount: 0
+        });
+
+        res.send({
+          success: true,
+          message: `Cleared ${result.deletedCount} notifications`,
+          deletedCount: result.deletedCount,
+        });
+      } catch (error) {
+        console.error("Error clearing notifications:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get unread notifications count
+    app.get("/notifications/unread-count", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const unreadCount = await notificationsCollection.countDocuments({
+          recipientId: new ObjectId(userId),
+          isRead: false,
+        });
+
+        res.send({
+          success: true,
+          unreadCount,
+        });
+      } catch (error) {
+        console.error("Error fetching unread count:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Real-time notification subscription endpoint
+    app.post("/notifications/subscribe", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        
+        res.send({
+          success: true,
+          message: "Use WebSocket connection for real-time notifications. Events: new_notification, unread_count_updated"
+        });
+      } catch (error) {
+        console.error("Error in notification subscription:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Create a test notification (for development)
+    app.post("/notifications/test", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { type = "test", message = "Test notification" } = req.body;
+
+        const notificationId = await createNotification({
+          type,
+          senderId: new ObjectId(userId),
+          recipientId: new ObjectId(userId),
+          message,
+          isRead: false
+        });
+
+        res.send({
+          success: true,
+          message: "Test notification created",
+          notificationId
+        });
+      } catch (error) {
+        console.error("Error creating test notification:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // JWT posting
+    app.post("/jwt", async (req, res) => {
       const user = req.body;
       const token = jwt.sign(user, process.env.ACCESS_TOKEN, {
         expiresIn: "72h",
@@ -69,124 +1026,122 @@ app.post("/jwt", async (req, res) => {
       res.cookie("token", token).send({ success: true, token });
     });
 
-function VerifyToken(req, res, next) {
-  const authHeader = req.headers.authorization;
-  console.log("Authorization header:", authHeader);
-  
-  if (!authHeader) {
-    console.log("No authorization header found");
-    return res.status(401).send({ message: "Access Denied - No Token Found" });
-  }
-  
-  const token = authHeader.split(" ")[1];
-  console.log("Extracted token:", token ? "Present" : "Missing");
-  
-  if (!token) {
-    return res.status(401).send({ message: "Access Denied - Invalid Token Format" });
-  }
+    function VerifyToken(req, res, next) {
+      const authHeader = req.headers.authorization;  
 
-  jwt.verify(token, process.env.ACCESS_TOKEN, (err, user) => {
-    if (err) {
-      console.log("JWT verification error:", err.message);
-      return res.status(403).send({ message: "Invalid Token" });
-    }
-    console.log("JWT verified successfully for user:", user);
-    req.user = user;
-    next();
-  });
-}
-
-
-app.post("/upload", VerifyToken, async (req, res) => {
-  try {
-    const { image } = req.body;
-
-    if (!image) {
-      return res.status(400).send({
-        success: false,
-        message: "No image data provided"
-      });
-    }
-
-    console.log("Received image upload request");
-
-    // Validate that it's a base64 image
-    if (!image.startsWith('data:image/')) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid image format. Expected base64 image data."
-      });
-    }
-
-    // Extract base64 data
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-    
-    // Validate image size
-    const imageSizeInBytes = (base64Data.length * 3) / 4;
-    if (imageSizeInBytes > 10 * 1024 * 1024) {
-      return res.status(413).send({
-        success: false,
-        message: "Image too large. Maximum size is 10MB."
-      });
-    }
-
-    console.log("Uploading image to imgBB...");
-
-    // Upload to imgBB
-    const formData = new URLSearchParams();
-    formData.append('image', base64Data);
-    
-    const imgBBResponse = await axios.post(
-      `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-      formData,
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        timeout: 30000
+      if (!authHeader) {
+        console.log("No authorization header found");
+        return res
+          .status(401)
+          .send({ message: "Access Denied - No Token Found" });
       }
-    );
 
-    console.log("imgBB response status:", imgBBResponse.status);
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res
+          .status(401)
+          .send({ message: "Access Denied - Invalid Token Format" });
+      }
 
-    if (imgBBResponse.data.success) {
-      const imageUrl = imgBBResponse.data.data.url;
-      
-      res.status(200).send({
-        success: true,
-        message: "Image uploaded successfully",
-        url: imageUrl, // Changed from imageUrl to url to match frontend expectation
-        imgBBData: imgBBResponse.data.data
-      });
-    } else {
-      throw new Error(imgBBResponse.data.error?.message || 'Image upload failed');
-    }
-  } catch (error) {
-    console.error("Error uploading image to imgBB:", error);
-    
-    if (error.code === 'ECONNABORTED') {
-      return res.status(408).send({
-        success: false,
-        message: "Image upload timeout. Please try again."
+      jwt.verify(token, process.env.ACCESS_TOKEN, (err, user) => {
+        if (err) {
+          console.log("JWT verification error:", err.message);
+          return res.status(403).send({ message: "Invalid Token" });
+        }
+        req.user = user;
+        next();
       });
     }
-    
-    if (error.response) {
-      res.status(error.response.status).send({
-        success: false,
-        message: "Image upload service error",
-        error: error.response.data.error?.message || 'Upload failed'
-      });
-    } else {
-      res.status(500).send({
-        success: false,
-        message: "Server error during image upload",
-        error: error.message
-      });
-    }
-  }
-});
 
+    app.post("/upload", VerifyToken, async (req, res) => {
+      try {
+        const { image } = req.body;
+
+        if (!image) {
+          return res.status(400).send({
+            success: false,
+            message: "No image data provided",
+          });
+        }
+
+        console.log("Received image upload request");
+
+        // Validate that it's a base64 image
+        if (!image.startsWith("data:image/")) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid image format. Expected base64 image data.",
+          });
+        }
+
+        // Extract base64 data
+        const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
+
+        // Validate image size
+        const imageSizeInBytes = (base64Data.length * 3) / 4;
+        if (imageSizeInBytes > 10 * 1024 * 1024) {
+          return res.status(413).send({
+            success: false,
+            message: "Image too large. Maximum size is 10MB.",
+          });
+        }
+
+        console.log("Uploading image to imgBB...");
+
+        // Upload to imgBB
+        const formData = new URLSearchParams();
+        formData.append("image", base64Data);
+
+        const imgBBResponse = await axios.post(
+          `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+          formData,
+          {
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout: 30000,
+          }
+        );
+
+        if (imgBBResponse.data.success) {
+          const imageUrl = imgBBResponse.data.data.url;
+
+          res.status(200).send({
+            success: true,
+            message: "Image uploaded successfully",
+            url: imageUrl,
+            imgBBData: imgBBResponse.data.data,
+          });
+        } else {
+          throw new Error(
+            imgBBResponse.data.error?.message || "Image upload failed"
+          );
+        }
+      } catch (error) {
+        console.error("Error uploading image to imgBB:", error);
+
+        if (error.code === "ECONNABORTED") {
+          return res.status(408).send({
+            success: false,
+            message: "Image upload timeout. Please try again.",
+          });
+        }
+
+        if (error.response) {
+          res.status(error.response.status).send({
+            success: false,
+            message: "Image upload service error",
+            error: error.response.data.error?.message || "Upload failed",
+          });
+        } else {
+          res.status(500).send({
+            success: false,
+            message: "Server error during image upload",
+            error: error.message,
+          });
+        }
+      }
+    });
 
     app.post("/logout", VerifyToken, (req, res) => {
       res.clearCookie("token");
@@ -196,8 +1151,8 @@ app.post("/upload", VerifyToken, async (req, res) => {
     // User Authentication APIs
     app.post("/signup", async (req, res) => {
       try {
-        const { name, email, password } = req.body;
-        
+        const { name, email, password, username } = req.body;
+
         // Check if user already exists
         const existingUser = await usersCollection.findOne({ email });
         if (existingUser) {
@@ -210,17 +1165,18 @@ app.post("/upload", VerifyToken, async (req, res) => {
         // Create user with default profile
         const newUser = {
           name,
+          username,
           email,
           password: hashedPassword,
-          profilePicture: "", // Empty by default
-          bio: "", // Empty by default
-          isProfileComplete: false, // Flag to check if profile needs completion
+          profilePicture: "",
+          bio: "",
+          isProfileComplete: false,
           createdAt: new Date(),
-          updatedAt: new Date()
+          updatedAt: new Date(),
         };
 
         const result = await usersCollection.insertOne(newUser);
-        
+
         // Generate token
         const token = jwt.sign(
           { userId: result.insertedId, email },
@@ -238,9 +1194,9 @@ app.post("/upload", VerifyToken, async (req, res) => {
             email,
             profilePicture: "",
             bio: "",
-            isProfileComplete: false
+            isProfileComplete: false,
           },
-          requiresProfileCompletion: true // Flag to redirect to profile page
+          requiresProfileCompletion: true,
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -282,9 +1238,9 @@ app.post("/upload", VerifyToken, async (req, res) => {
             email: user.email,
             profilePicture: user.profilePicture || "",
             bio: user.bio || "",
-            isProfileComplete: !requiresProfileCompletion
+            isProfileComplete: !requiresProfileCompletion,
           },
-          requiresProfileCompletion: requiresProfileCompletion
+          requiresProfileCompletion: requiresProfileCompletion,
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -295,22 +1251,29 @@ app.post("/upload", VerifyToken, async (req, res) => {
     app.put("/profile", VerifyToken, async (req, res) => {
       try {
         const userId = req.user.userId;
-        const { profilePicture, bio, name } = req.body;
+        const { profilePicture, bio, name, coverPhoto } = req.body;
 
         const updateData = {
-          updatedAt: new Date()
+          updatedAt: new Date(),
         };
 
         // Only update fields that are provided
-        if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
+        if (profilePicture !== undefined)
+          updateData.profilePicture = profilePicture;
         if (bio !== undefined) updateData.bio = bio;
         if (name !== undefined) updateData.name = name;
+        if (coverPhoto !== undefined) updateData.coverPhoto = coverPhoto;
 
         // Check if profile is complete (has both profile picture and bio)
-        const currentUser = await usersCollection.findOne({ _id: new ObjectId(userId) });
-        const hasProfilePicture = profilePicture !== undefined ? profilePicture : currentUser.profilePicture;
+        const currentUser = await usersCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+        const hasProfilePicture =
+          profilePicture !== undefined
+            ? profilePicture
+            : currentUser.profilePicture;
         const hasBio = bio !== undefined ? bio : currentUser.bio;
-        
+
         updateData.isProfileComplete = !!(hasProfilePicture && hasBio);
 
         const result = await usersCollection.updateOne(
@@ -332,7 +1295,7 @@ app.post("/upload", VerifyToken, async (req, res) => {
           success: true,
           message: "Profile updated successfully",
           user: updatedUser,
-          isProfileComplete: updateData.isProfileComplete
+          isProfileComplete: updateData.isProfileComplete,
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -355,15 +1318,15 @@ app.post("/upload", VerifyToken, async (req, res) => {
 
         // Get user's posts count
         const postsCount = await postsCollection.countDocuments({
-          userId: new ObjectId(userId)
+          userId: new ObjectId(userId),
         });
 
         // Get friends count
         const friendsCount = await friendsCollection.countDocuments({
           $or: [
             { requesterId: new ObjectId(userId), status: "accepted" },
-            { recipientId: new ObjectId(userId), status: "accepted" }
-          ]
+            { recipientId: new ObjectId(userId), status: "accepted" },
+          ],
         });
 
         res.send({
@@ -371,8 +1334,8 @@ app.post("/upload", VerifyToken, async (req, res) => {
           user: {
             ...user,
             postsCount,
-            friendsCount
-          }
+            friendsCount,
+          },
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -386,11 +1349,11 @@ app.post("/upload", VerifyToken, async (req, res) => {
 
         const user = await usersCollection.findOne(
           { _id: new ObjectId(userId) },
-          { 
-            projection: { 
+          {
+            projection: {
               password: 0,
-              email: 0 // Don't expose email in public profile
-            } 
+              email: 0,
+            },
           }
         );
 
@@ -400,31 +1363,31 @@ app.post("/upload", VerifyToken, async (req, res) => {
 
         // Get user's posts count
         const postsCount = await postsCollection.countDocuments({
-          userId: new ObjectId(userId)
+          userId: new ObjectId(userId),
         });
 
         // Get friends count
         const friendsCount = await friendsCollection.countDocuments({
           $or: [
             { requesterId: new ObjectId(userId), status: "accepted" },
-            { recipientId: new ObjectId(userId), status: "accepted" }
-          ]
+            { recipientId: new ObjectId(userId), status: "accepted" },
+          ],
         });
 
         // Check if current user is friends with this user
         const isFriend = await friendsCollection.findOne({
           $or: [
-            { 
-              requesterId: new ObjectId(req.user.userId), 
+            {
+              requesterId: new ObjectId(req.user.userId),
               recipientId: new ObjectId(userId),
-              status: "accepted"
+              status: "accepted",
             },
-            { 
-              requesterId: new ObjectId(userId), 
+            {
+              requesterId: new ObjectId(userId),
               recipientId: new ObjectId(req.user.userId),
-              status: "accepted"
-            }
-          ]
+              status: "accepted",
+            },
+          ],
         });
 
         res.send({
@@ -433,8 +1396,8 @@ app.post("/upload", VerifyToken, async (req, res) => {
             ...user,
             postsCount,
             friendsCount,
-            isFriend: !!isFriend
-          }
+            isFriend: !!isFriend,
+          },
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -442,281 +1405,320 @@ app.post("/upload", VerifyToken, async (req, res) => {
     });
 
     // Post APIs
-app.post("/posts", VerifyToken, async (req, res) => {
-  try {
-    const { content, image, privacy = "public" } = req.body;
-    const userId = req.user.userId;
-
-    // Validate required fields
-    if (!content && !image) {
-      return res.status(400).send({
-        success: false,
-        message: "Post must contain either content or image"
-      });
-    }
-
-    let imageUrl = "";
-    let imageData = null;
-
-    // If image is provided as base64, upload it first
-    if (image && image.startsWith('data:image/')) {
-      console.log("Detected base64 image, uploading to imgBB...");
-      
+    app.post("/posts", VerifyToken, async (req, res) => {
       try {
-        // Upload directly to imgBB instead of internal endpoint
-        const base64Data = image.replace(/^data:image\/\w+;base64,/, '');
-        
-        const formData = new URLSearchParams();
-        formData.append('image', base64Data);
-        
-        const imgBBResponse = await axios.post(
-          `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-          formData,
-          {
-            headers: {
-              'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            timeout: 30000
+        const { content, image, privacy } = req.body;
+        const userId = req.user.userId;
+
+        // Validate required fields
+        if (!content && !image) {
+          return res.status(400).send({
+            success: false,
+            message: "Post must contain either content or image",
+          });
+        }
+
+        let imageUrl = "";
+        let imageData = null;
+
+        // If image is provided as base64, upload it first
+        if (image && image.startsWith("data:image/")) {
+          console.log("Detected base64 image, uploading to imgBB...");
+
+          try {
+            // Upload directly to imgBB instead of internal endpoint
+            const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
+
+            const formData = new URLSearchParams();
+            formData.append("image", base64Data);
+
+            const imgBBResponse = await axios.post(
+              `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+              formData,
+              {
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout: 30000,
+              }
+            );
+
+            if (imgBBResponse.data.success) {
+              const imgBBData = imgBBResponse.data.data;
+              imageUrl = imgBBData.url;
+              imageData = {
+                url: imgBBData.url,
+                thumbUrl: imgBBData.thumb?.url || imgBBData.url,
+                mediumUrl: imgBBData.medium?.url || imgBBData.url,
+                deleteUrl: imgBBData.delete_url,
+                imageId: imgBBData.id,
+              };
+              console.log("Image uploaded successfully:", imageUrl);
+            }
+          } catch (uploadError) {
+            console.error("Failed to upload image:", uploadError);
+            // Continue without image if upload fails
           }
+        } else if (image) {
+          // If it's already a URL, use it directly
+          imageUrl = image;
+        }
+
+        const newPost = {
+          userId: new ObjectId(userId),
+          content: content || "",
+          image: imageUrl,
+          imageData: imageData,
+          privacy,
+          likes: [],
+          comments: [],
+          shares: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        console.log("Creating post with data:", {
+          content: newPost.content,
+          hasImage: !!newPost.image,
+          privacy: newPost.privacy,
+        });
+
+        const result = await postsCollection.insertOne(newPost);
+
+        // Populate user details
+        const post = await postsCollection
+          .aggregate([
+            { $match: { _id: result.insertedId } },
+            {
+              $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "user",
+              },
+            },
+            { $unwind: "$user" },
+            {
+              $project: {
+                "user.password": 0,
+                "user.email": 0,
+              },
+            },
+          ])
+          .toArray();
+
+        console.log("Post created successfully:", post[0]._id);
+
+        res.status(201).send({
+          success: true,
+          message: "Post created successfully",
+          post: post[0],
+        });
+      } catch (error) {
+        console.error("Error creating post:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while creating post",
+          error: error.message,
+        });
+      }
+    });
+
+    // Health check endpoint
+    app.get("/health", (req, res) => {
+      res.status(200).json({
+        success: true,
+        message: "Server is running with WebSocket support",
+        timestamp: new Date().toISOString(),
+        websocket: true,
+        database: "connected"
+      });
+    });
+
+    // Get posts with image support
+    app.get("/posts", VerifyToken, async (req, res) => {
+      try {
+        const { page = 1, limit = 10, userId } = req.query;
+        const currentUserId = req.user.userId;
+        const skip = (page - 1) * parseInt(limit);
+
+        // Get current user's friends list
+        const currentUser = await usersCollection.findOne(
+          { _id: new ObjectId(currentUserId) },
+          { projection: { friends: 1 } }
         );
 
-        if (imgBBResponse.data.success) {
-          const imgBBData = imgBBResponse.data.data;
-          imageUrl = imgBBData.url;
-          imageData = {
-            url: imgBBData.url,
-            thumbUrl: imgBBData.thumb?.url || imgBBData.url,
-            mediumUrl: imgBBData.medium?.url || imgBBData.url,
-            deleteUrl: imgBBData.delete_url,
-            imageId: imgBBData.id
-          };
-          console.log("Image uploaded successfully:", imageUrl);
-        }
-      } catch (uploadError) {
-        console.error("Failed to upload image:", uploadError);
-        // Continue without image if upload fails
-      }
-    } else if (image) {
-      // If it's already a URL, use it directly
-      imageUrl = image;
-    }
+        const friendsIds = currentUser?.friends || [];
+        
+        // Build privacy filter query
+        const privacyMatchQuery = {
+          $or: [
+            { privacy: "public" },
+            { 
+              privacy: "friends", 
+              userId: { $in: [new ObjectId(currentUserId), ...friendsIds.map(id => new ObjectId(id))] }
+            },
+            { userId: new ObjectId(currentUserId) }
+          ]
+        };
 
-    const newPost = {
-      userId: new ObjectId(userId),
-      content: content || "",
-      image: imageUrl,
-      imageData: imageData,
-      privacy,
-      likes: [],
-      comments: [],
-      shares: 0,
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-
-    console.log("Creating post with data:", {
-      content: newPost.content,
-      hasImage: !!newPost.image,
-      privacy: newPost.privacy
-    });
-
-    const result = await postsCollection.insertOne(newPost);
-    
-    // Populate user details
-    const post = await postsCollection.aggregate([
-      { $match: { _id: result.insertedId } },
-      {
-        $lookup: {
-          from: "users",
-          localField: "userId",
-          foreignField: "_id",
-          as: "user"
-        }
-      },
-      { $unwind: "$user" },
-      {
-        $project: {
-          "user.password": 0,
-          "user.email": 0
-        }
-      }
-    ]).toArray();
-
-    console.log("Post created successfully:", post[0]._id);
-
-    res.status(201).send({
-      success: true,
-      message: "Post created successfully",
-      post: post[0]
-    });
-  } catch (error) {
-    console.error("Error creating post:", error);
-    res.status(500).send({ 
-      success: false,
-      message: "Server error while creating post", 
-      error: error.message 
-    });
-  }
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'Server is running',
-    timestamp: new Date().toISOString()
-  });
-});
-
-
-// Get posts with image support
-app.get("/posts", VerifyToken, async (req, res) => {
-  try {
-    const { page = 1, limit = 10, userId } = req.query;
-    const skip = (page - 1) * parseInt(limit);
-
-    // Build match query
-    const matchQuery = {};
-    if (userId) {
-      matchQuery.userId = new ObjectId(userId);
-    }
-
-    const posts = await postsCollection.aggregate([
-      { $match: matchQuery },
-      {
-        $lookup: {
-          from: "users",
-          localField: "userId",
-          foreignField: "_id",
-          as: "user"
-        }
-      },
-      { $unwind: "$user" },
-      {
-        $project: {
-          "user.password": 0,
-          "user.email": 0
-        }
-      },
-      { $sort: { createdAt: -1 } },
-      { $skip: skip },
-      { $limit: parseInt(limit) }
-    ]).toArray();
-
-    res.send({
-      success: true,
-      posts,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: await postsCollection.countDocuments(matchQuery)
-      }
-    });
-  } catch (error) {
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Update post with image support
-app.put("/posts/:id", VerifyToken, async (req, res) => {
-  try {
-    const postId = req.params.id;
-    const { content, image, privacy } = req.body;
-    const userId = req.user.userId;
-
-    // Check if post exists and user owns it
-    const post = await postsCollection.findOne({ 
-      _id: new ObjectId(postId), 
-      userId: new ObjectId(userId) 
-    });
-
-    if (!post) {
-      return res.status(404).send({ message: "Post not found or unauthorized" });
-    }
-
-    let imageUrl = post.image;
-    let imageData = post.imageData;
-
-    // Handle image update
-    if (image && image !== post.image) {
-      if (image.startsWith('data:image/')) {
-        // New base64 image - upload it
-        try {
-          const uploadResponse = await axios.post(
-            `http://localhost:${port}/upload-base64`,
-            { image },
-            {
-              headers: {
-                'Authorization': req.headers.authorization,
-                'Content-Type': 'application/json'
-              }
+        // Add user filter if specified
+        const finalMatchQuery = userId 
+          ? { 
+              $and: [
+                { userId: new ObjectId(userId) },
+                privacyMatchQuery
+              ]
             }
-          );
+          : privacyMatchQuery;
 
-          if (uploadResponse.data.success) {
-            imageUrl = uploadResponse.data.imageUrl;
-            imageData = {
-              url: uploadResponse.data.imageUrl,
-              thumbUrl: uploadResponse.data.thumbUrl,
-              mediumUrl: uploadResponse.data.mediumUrl,
-              deleteUrl: uploadResponse.data.deleteUrl,
-              imageId: uploadResponse.data.imageId
-            };
-          }
-        } catch (uploadError) {
-          console.error("Failed to upload new image:", uploadError);
-          // Keep old image if upload fails
-        }
-      } else {
-        // It's already a URL
-        imageUrl = image;
-        imageData = null; // Reset image data for external URLs
+        const posts = await postsCollection
+          .aggregate([
+            { $match: finalMatchQuery },
+            {
+              $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "user",
+              },
+            },
+            { $unwind: "$user" },
+            {
+              $project: {
+                "user.password": 0,
+                "user.email": 0,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: parseInt(limit) },
+          ])
+          .toArray();
+
+        res.send({
+          success: true,
+          posts,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: await postsCollection.countDocuments(finalMatchQuery),
+          },
+        });
+      } catch (error) {
+        console.error("Error fetching posts:", error);
+        res.status(500).send({ 
+          success: false,
+          message: "Server error", 
+          error: error.message 
+        });
       }
-    }
-
-    const updateData = {
-      content: content !== undefined ? content : post.content,
-      image: imageUrl,
-      imageData: imageData,
-      privacy: privacy || post.privacy,
-      updatedAt: new Date()
-    };
-
-    await postsCollection.updateOne(
-      { _id: new ObjectId(postId) },
-      { $set: updateData }
-    );
-
-    res.send({
-      success: true,
-      message: "Post updated successfully"
     });
-  } catch (error) {
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
+
+    // Update post with image support
+    app.put("/posts/:id", VerifyToken, async (req, res) => {
+      try {
+        const postId = req.params.id;
+        const { content, image, privacy } = req.body;
+        const userId = req.user.userId;
+
+        // Check if post exists and user owns it
+        const post = await postsCollection.findOne({
+          _id: new ObjectId(postId),
+          userId: new ObjectId(userId),
+        });
+
+        if (!post) {
+          return res
+            .status(404)
+            .send({ message: "Post not found or unauthorized" });
+        }
+
+        let imageUrl = post.image;
+        let imageData = post.imageData;
+
+        // Handle image update
+        if (image && image !== post.image) {
+          if (image.startsWith("data:image/")) {
+            // New base64 image - upload it
+            try {
+              const uploadResponse = await axios.post(
+                `http://localhost:${port}/upload`,
+                { image },
+                {
+                  headers: {
+                    Authorization: req.headers.authorization,
+                    "Content-Type": "application/json",
+                  },
+                }
+              );
+
+              if (uploadResponse.data.success) {
+                imageUrl = uploadResponse.data.url;
+                imageData = {
+                  url: uploadResponse.data.url,
+                  thumbUrl: uploadResponse.data.thumbUrl,
+                  mediumUrl: uploadResponse.data.mediumUrl,
+                  deleteUrl: uploadResponse.data.deleteUrl,
+                  imageId: uploadResponse.data.imageId,
+                };
+              }
+            } catch (uploadError) {
+              console.error("Failed to upload new image:", uploadError);
+              // Keep old image if upload fails
+            }
+          } else {
+            // It's already a URL
+            imageUrl = image;
+            imageData = null;
+          }
+        }
+
+        const updateData = {
+          content: content !== undefined ? content : post.content,
+          image: imageUrl,
+          imageData: imageData,
+          privacy: privacy || post.privacy,
+          updatedAt: new Date(),
+        };
+
+        await postsCollection.updateOne(
+          { _id: new ObjectId(postId) },
+          { $set: updateData }
+        );
+
+        res.send({
+          success: true,
+          message: "Post updated successfully",
+        });
+      } catch (error) {
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
 
     app.get("/posts/:id", VerifyToken, async (req, res) => {
       try {
         const postId = req.params.id;
 
-        const post = await postsCollection.aggregate([
-          { $match: { _id: new ObjectId(postId) } },
-          {
-            $lookup: {
-              from: "users",
-              localField: "userId",
-              foreignField: "_id",
-              as: "user"
-            }
-          },
-          { $unwind: "$user" },
-          {
-            $project: {
-              "user.password": 0
-            }
-          }
-        ]).toArray();
+        const post = await postsCollection
+          .aggregate([
+            { $match: { _id: new ObjectId(postId) } },
+            {
+              $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "user",
+              },
+            },
+            { $unwind: "$user" },
+            {
+              $project: {
+                "user.password": 0,
+              },
+            },
+          ])
+          .toArray();
 
         if (!post.length) {
           return res.status(404).send({ message: "Post not found" });
@@ -724,14 +1726,12 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
 
         res.send({
           success: true,
-          post: post[0]
+          post: post[0],
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
-
-
 
     app.delete("/posts/:id", VerifyToken, async (req, res) => {
       try {
@@ -739,38 +1739,45 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
         const userId = req.user.userId;
 
         // Check if post exists and user owns it
-        const post = await postsCollection.findOne({ 
-          _id: new ObjectId(postId), 
-          userId: new ObjectId(userId) 
+        const post = await postsCollection.findOne({
+          _id: new ObjectId(postId),
+          userId: new ObjectId(userId),
         });
 
         if (!post) {
-          return res.status(404).send({ message: "Post not found or unauthorized" });
+          return res
+            .status(404)
+            .send({ message: "Post not found or unauthorized" });
         }
 
         await postsCollection.deleteOne({ _id: new ObjectId(postId) });
 
         res.send({
           success: true,
-          message: "Post deleted successfully"
+          message: "Post deleted successfully",
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
-    // Like/Unlike Post
+    // Enhanced Like/Unlike Post with Notification
     app.post("/posts/:id/like", VerifyToken, async (req, res) => {
       try {
         const postId = req.params.id;
         const userId = req.user.userId;
 
-        const post = await postsCollection.findOne({ _id: new ObjectId(postId) });
+        const post = await postsCollection.findOne({
+          _id: new ObjectId(postId),
+        });
+        
         if (!post) {
           return res.status(404).send({ message: "Post not found" });
         }
 
-        const hasLiked = post.likes.some(like => like.userId.toString() === userId);
+        const hasLiked = post.likes.some(
+          (like) => like.userId.toString() === userId
+        );
 
         if (hasLiked) {
           // Unlike
@@ -778,33 +1785,50 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
             { _id: new ObjectId(postId) },
             { $pull: { likes: { userId: new ObjectId(userId) } } }
           );
+          
           res.send({ success: true, message: "Post unliked", liked: false });
         } else {
-          // Like
+          // Like with notification
           await postsCollection.updateOne(
             { _id: new ObjectId(postId) },
-            { 
-              $push: { 
-                likes: { 
-                  userId: new ObjectId(userId), 
-                  likedAt: new Date() 
-                } 
-              } 
+            {
+              $push: {
+                likes: {
+                  userId: new ObjectId(userId),
+                  likedAt: new Date(),
+                },
+              },
             }
           );
+
+          // Create notification for post owner (unless it's their own post)
+          if (post.userId.toString() !== userId) {
+            await createPostInteractionNotification({
+              type: NOTIFICATION_TYPES.POST_LIKE,
+              postId: postId,
+              senderId: userId,
+              recipientId: post.userId,
+              content: '', // No content for likes
+              metadata: {
+                likeId: new ObjectId() // Generate a new ID for the like
+              }
+            });
+          }
+
           res.send({ success: true, message: "Post liked", liked: true });
         }
       } catch (error) {
+        console.error("Error in like endpoint:", error);
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
-    // Comment on Post
+    // Enhanced Comment on Post with Notification
     app.post("/posts/:id/comment", VerifyToken, async (req, res) => {
       try {
         const postId = req.params.id;
         const userId = req.user.userId;
-        const { content } = req.body;
+        const { content, parentCommentId } = req.body; // Add parentCommentId for replies
 
         if (!content) {
           return res.status(400).send({ message: "Comment content is required" });
@@ -814,7 +1838,11 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
           _id: new ObjectId(),
           userId: new ObjectId(userId),
           content,
-          createdAt: new Date()
+          parentCommentId: parentCommentId ? new ObjectId(parentCommentId) : null,
+          replies: [],
+          likes: [],
+          createdAt: new Date(),
+          updatedAt: new Date()
         };
 
         await postsCollection.updateOne(
@@ -828,86 +1856,291 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
           { projection: { name: 1, profilePicture: 1 } }
         );
 
+        // Get post details for notification
+        const post = await postsCollection.findOne(
+          { _id: new ObjectId(postId) },
+          { projection: { userId: 1, content: 1 } }
+        );
+
+        let notificationType = NOTIFICATION_TYPES.POST_COMMENT;
+        let recipientId = post.userId;
+        let metadata = { commentId: comment._id };
+
+        // If this is a reply to a comment, notify the comment author
+        if (parentCommentId) {
+          // Find the parent comment to get its author
+          const postWithComment = await postsCollection.findOne(
+            { 
+              _id: new ObjectId(postId),
+              "comments._id": new ObjectId(parentCommentId)
+            },
+            { projection: { "comments.$": 1 } }
+          );
+          
+          if (postWithComment && postWithComment.comments.length > 0) {
+            const parentComment = postWithComment.comments[0];
+            notificationType = NOTIFICATION_TYPES.COMMENT_REPLY;
+            recipientId = parentComment.userId;
+            metadata.parentCommentId = new ObjectId(parentCommentId);
+          }
+        }
+
+        // Create notification (unless commenting on own post/comment)
+        if (recipientId.toString() !== userId) {
+          await createPostInteractionNotification({
+            type: notificationType,
+            postId: postId,
+            commentId: comment._id,
+            senderId: userId,
+            recipientId: recipientId,
+            content: content,
+            metadata: metadata
+          });
+        }
+
         res.send({
           success: true,
-          message: "Comment added successfully",
+          message: parentCommentId ? "Reply added successfully" : "Comment added successfully",
           comment: {
             ...comment,
             user: {
               name: user.name,
-              profilePicture: user.profilePicture
-            }
-          }
+              profilePicture: user.profilePicture,
+            },
+            isReply: !!parentCommentId
+          },
         });
       } catch (error) {
+        console.error("Error in comment endpoint:", error);
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
-    // Share Post
+    // Enhanced Share Post with Notification
     app.post("/posts/:id/share", VerifyToken, async (req, res) => {
       try {
         const postId = req.params.id;
         const userId = req.user.userId;
+        const { sharedContent } = req.body;
 
-        // Increment share count
+        // Get original post
+        const originalPost = await postsCollection.findOne({
+          _id: new ObjectId(postId),
+        });
+
+        if (!originalPost) {
+          return res.status(404).send({ message: "Original post not found" });
+        }
+
+        // Increment share count on original post
         await postsCollection.updateOne(
           { _id: new ObjectId(postId) },
           { $inc: { shares: 1 } }
         );
 
         // Create a new shared post
-        const originalPost = await postsCollection.findOne({ _id: new ObjectId(postId) });
-        
         const sharedPost = {
           userId: new ObjectId(userId),
-          content: `Shared: ${originalPost.content}`,
+          content: sharedContent || `Shared: ${originalPost.content.substring(0, 100)}...`,
           originalPostId: new ObjectId(postId),
           isShared: true,
           likes: [],
           comments: [],
           shares: 0,
           createdAt: new Date(),
-          updatedAt: new Date()
+          updatedAt: new Date(),
         };
 
-        await postsCollection.insertOne(sharedPost);
+        const result = await postsCollection.insertOne(sharedPost);
+
+        // Create notification for original post owner (unless sharing own post)
+        if (originalPost.userId.toString() !== userId) {
+          await createPostInteractionNotification({
+            type: NOTIFICATION_TYPES.POST_SHARE,
+            postId: postId,
+            senderId: userId,
+            recipientId: originalPost.userId,
+            content: sharedContent || '',
+            metadata: {
+              sharedPostId: result.insertedId,
+              originalPostId: new ObjectId(postId)
+            }
+          });
+        }
 
         res.send({
           success: true,
-          message: "Post shared successfully"
+          message: "Post shared successfully",
+          sharedPostId: result.insertedId
         });
       } catch (error) {
+        console.error("Error in share endpoint:", error);
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
-    // Friend System APIs
-    app.get("/users/search", VerifyToken, async (req, res) => {
+    // Like/Unlike Comment
+    app.post("/posts/:postId/comments/:commentId/like", VerifyToken, async (req, res) => {
       try {
-        const { q } = req.query;
-        
-        if (!q) {
-          return res.status(400).send({ message: "Search query is required" });
+        const { postId, commentId } = req.params;
+        const userId = req.user.userId;
+
+        const post = await postsCollection.findOne({
+          _id: new ObjectId(postId),
+          "comments._id": new ObjectId(commentId)
+        });
+
+        if (!post) {
+          return res.status(404).send({ message: "Post or comment not found" });
         }
 
-        const users = await usersCollection.find({
-          $or: [
-            { name: { $regex: q, $options: "i" } },
-            { email: { $regex: q, $options: "i" } }
-          ]
-        }, {
-          projection: {
-            password: 0
+        const comment = post.comments.find(c => c._id.toString() === commentId);
+        const hasLiked = comment.likes.some(like => like.userId.toString() === userId);
+
+        if (hasLiked) {
+          // Unlike comment
+          await postsCollection.updateOne(
+            { 
+              _id: new ObjectId(postId),
+              "comments._id": new ObjectId(commentId)
+            },
+            { 
+              $pull: { 
+                "comments.$.likes": { userId: new ObjectId(userId) } 
+              } 
+            }
+          );
+          
+          res.send({ success: true, message: "Comment unliked", liked: false });
+        } else {
+          // Like comment
+          await postsCollection.updateOne(
+            { 
+              _id: new ObjectId(postId),
+              "comments._id": new ObjectId(commentId)
+            },
+            { 
+              $push: { 
+                "comments.$.likes": { 
+                  userId: new ObjectId(userId),
+                  likedAt: new Date()
+                } 
+              } 
+            }
+          );
+
+          // Create notification for comment owner (unless it's their own comment)
+          if (comment.userId.toString() !== userId) {
+            await createPostInteractionNotification({
+              type: NOTIFICATION_TYPES.POST_LIKE, // Or create COMMENT_LIKE type if needed
+              postId: postId,
+              commentId: new ObjectId(commentId),
+              senderId: userId,
+              recipientId: comment.userId,
+              content: comment.content,
+              metadata: {
+                interaction: 'comment_like'
+              }
+            });
           }
-        }).toArray();
+
+          res.send({ success: true, message: "Comment liked", liked: true });
+        }
+      } catch (error) {
+        console.error("Error in comment like endpoint:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // Get comment replies
+    app.get("/posts/:postId/comments/:commentId/replies", VerifyToken, async (req, res) => {
+      try {
+        const { postId, commentId } = req.params;
+
+        const post = await postsCollection.findOne(
+          { 
+            _id: new ObjectId(postId),
+            "comments._id": new ObjectId(commentId)
+          },
+          { 
+            projection: { 
+              "comments.$": 1 
+            } 
+          }
+        );
+
+        if (!post || !post.comments.length) {
+          return res.status(404).send({ message: "Comment not found" });
+        }
+
+        const comment = post.comments[0];
+        
+        // Get user details for replies
+        const repliesWithUsers = await Promise.all(
+          (comment.replies || []).map(async (reply) => {
+            const user = await usersCollection.findOne(
+              { _id: reply.userId },
+              { projection: { name: 1, profilePicture: 1 } }
+            );
+            return {
+              ...reply,
+              user: {
+                name: user.name,
+                profilePicture: user.profilePicture
+              }
+            };
+          })
+        );
 
         res.send({
           success: true,
-          users
+          replies: repliesWithUsers
         });
       } catch (error) {
+        console.error("Error fetching comment replies:", error);
         res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    app.get("/users/search/:name", VerifyToken, async (req, res) => {
+      try {
+        const { name } = req.params;
+
+        if (!name) {
+          return res.status(400).json({
+            success: false,
+            message: "Search parameter is required",
+          });
+        }
+
+        console.log("Searching for:", name);
+
+        const users = await usersCollection
+          .find(
+            {
+              $or: [
+                { name: { $regex: name, $options: "i" } },
+                { email: { $regex: name, $options: "i" } },
+                { username: { $regex: name, $options: "i" } },
+              ],
+            },
+            {
+              projection: { password: 0 },
+            }
+          )
+          .toArray();
+
+        res.json({
+          success: true,
+          users: users || [],
+        });
+      } catch (error) {
+        console.error("Search error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
       }
     });
 
@@ -917,64 +2150,100 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
         const friendId = req.params.friendId;
 
         if (userId === friendId) {
-          return res.status(400).send({ message: "Cannot add yourself as friend" });
+          return res
+            .status(400)
+            .send({ message: "Cannot add yourself as friend" });
         }
 
         // Check if friend request already exists
         const existingRequest = await friendsCollection.findOne({
           $or: [
-            { requesterId: new ObjectId(userId), recipientId: new ObjectId(friendId) },
-            { requesterId: new ObjectId(friendId), recipientId: new ObjectId(userId) }
-          ]
+            {
+              requesterId: new ObjectId(userId),
+              recipientId: new ObjectId(friendId),
+            },
+            {
+              requesterId: new ObjectId(friendId),
+              recipientId: new ObjectId(userId),
+            },
+          ],
         });
 
         if (existingRequest) {
-          return res.status(400).send({ message: "Friend request already exists" });
+          return res
+            .status(400)
+            .send({ message: "Friend request already exists" });
         }
 
         // Create friend request
         const friendRequest = {
           requesterId: new ObjectId(userId),
           recipientId: new ObjectId(friendId),
-          status: "pending", // pending, accepted, rejected
-          createdAt: new Date()
+          status: "pending",
+          createdAt: new Date(),
         };
 
         await friendsCollection.insertOne(friendRequest);
 
+        // Create notification for the recipient
+        await createNotification({
+          type: "friend_request",
+          senderId: new ObjectId(userId),
+          recipientId: new ObjectId(friendId),
+          message: "sent you a friend request",
+          metadata: {
+            requestId: friendRequest._id
+          }
+        });
+
         res.status(201).send({
           success: true,
-          message: "Friend request sent successfully"
+          message: "Friend request sent successfully",
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
 
-    app.put("/friends/:friendId", VerifyToken, async (req, res) => {
+    app.put("/friends/:requestId", VerifyToken, async (req, res) => {
       try {
-        const friendId = req.params.friendId;
-        const userId = req.user.userId;
-        const { action } = req.body; // "accept" or "reject"
+        const requestId = req.params.requestId;
+        const { action } = req.body;
 
         const friendRequest = await friendsCollection.findOne({
-          requesterId: new ObjectId(friendId),
-          recipientId: new ObjectId(userId),
-          status: "pending"
+          _id: new ObjectId(requestId),
+          status: "pending",
         });
 
         if (!friendRequest) {
           return res.status(404).send({ message: "Friend request not found" });
         }
 
+        // Verify the logged-in user is the recipient
+        if (friendRequest.recipientId.toString() !== req.user.userId) {
+          return res
+            .status(403)
+            .send({ message: "Not authorized to respond to this request" });
+        }
+
         await friendsCollection.updateOne(
-          { _id: friendRequest._id },
+          { _id: new ObjectId(requestId) },
           { $set: { status: action === "accept" ? "accepted" : "rejected" } }
         );
 
+        // Create notification for the requester
+        if (action === "accept") {
+          await createNotification({
+            type: "friend_request_accepted",
+            senderId: new ObjectId(req.user.userId),
+            recipientId: friendRequest.requesterId,
+            message: "accepted your friend request"
+          });
+        }
+
         res.send({
           success: true,
-          message: `Friend request ${action}ed successfully`
+          message: `Friend request ${action}ed successfully`,
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -988,18 +2257,26 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
 
         const result = await friendsCollection.deleteOne({
           $or: [
-            { requesterId: new ObjectId(userId), recipientId: new ObjectId(friendId) },
-            { requesterId: new ObjectId(friendId), recipientId: new ObjectId(userId) }
-          ]
+            {
+              requesterId: new ObjectId(userId),
+              recipientId: new ObjectId(friendId),
+            },
+            {
+              requesterId: new ObjectId(friendId),
+              recipientId: new ObjectId(userId),
+            },
+          ],
         });
 
         if (result.deletedCount === 0) {
-          return res.status(404).send({ message: "Friend relationship not found" });
+          return res
+            .status(404)
+            .send({ message: "Friend relationship not found" });
         }
 
         res.send({
           success: true,
-          message: "Friend removed successfully"
+          message: "Friend removed successfully",
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -1017,7 +2294,7 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
           image,
           content: content || "",
           createdAt: new Date(),
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         };
 
         const result = await storiesCollection.insertOne(newStory);
@@ -1027,8 +2304,8 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
           message: "Story created successfully",
           story: {
             id: result.insertedId,
-            ...newStory
-          }
+            ...newStory,
+          },
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
@@ -1037,130 +2314,566 @@ app.put("/posts/:id", VerifyToken, async (req, res) => {
 
     app.get("/stories", VerifyToken, async (req, res) => {
       try {
-        const stories = await storiesCollection.aggregate([
-          {
-            $lookup: {
-              from: "users",
-              localField: "userId",
-              foreignField: "_id",
-              as: "user"
-            }
-          },
-          { $unwind: "$user" },
-          {
-            $project: {
-              "user.password": 0
-            }
-          },
-          { $sort: { createdAt: -1 } }
-        ]).toArray();
+        const stories = await storiesCollection
+          .aggregate([
+            {
+              $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "user",
+              },
+            },
+            { $unwind: "$user" },
+            {
+              $project: {
+                "user.password": 0,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+          ])
+          .toArray();
 
         res.send({
           success: true,
-          stories
+          stories,
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
-// Get friend requests for current user
-app.get("/friends/requests", VerifyToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    
-    const requests = await friendsCollection.aggregate([
-      {
-        $match: {
-          recipientId: new ObjectId(userId),
-          status: "pending"
-        }
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "requesterId",
-          foreignField: "_id",
-          as: "requester"
-        }
-      },
-      {
-        $unwind: "$requester"
-      },
-      {
-        $project: {
-          "requester.password": 0
-        }
-      },
-      {
-        $sort: { createdAt: -1 }
+
+    // Get friend requests for current user
+    app.get("/friends/requests", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const requests = await friendsCollection
+          .aggregate([
+            {
+              $match: {
+                recipientId: new ObjectId(userId),
+                status: "pending",
+              },
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "requesterId",
+                foreignField: "_id",
+                as: "requester",
+              },
+            },
+            {
+              $unwind: "$requester",
+            },
+            {
+              $project: {
+                "requester.password": 0,
+              },
+            },
+            {
+              $sort: { createdAt: -1 },
+            },
+          ])
+          .toArray();
+
+        res.send({
+          success: true,
+          requests,
+        });
+      } catch (error) {
+        res.status(500).send({ message: "Server error", error: error.message });
       }
-    ]).toArray();
-
-    res.send({
-      success: true,
-      requests
     });
-  } catch (error) {
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
 
-// Get current user's friends
-app.get("/friends", VerifyToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    
-    const friends = await friendsCollection.aggregate([
-      {
-        $match: {
-          $or: [
-            { requesterId: new ObjectId(userId), status: "accepted" },
-            { recipientId: new ObjectId(userId), status: "accepted" }
-          ]
+    // Get current user's friends
+    app.get("/friends", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const friends = await friendsCollection
+          .aggregate([
+            {
+              $match: {
+                $or: [
+                  { requesterId: new ObjectId(userId), status: "accepted" },
+                  { recipientId: new ObjectId(userId), status: "accepted" },
+                ],
+              },
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "requesterId",
+                foreignField: "_id",
+                as: "requester",
+              },
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "recipientId",
+                foreignField: "_id",
+                as: "recipient",
+              },
+            },
+            {
+              $project: {
+                user: {
+                  $cond: {
+                    if: { $eq: ["$requesterId", new ObjectId(userId)] },
+                    then: { $arrayElemAt: ["$recipient", 0] },
+                    else: { $arrayElemAt: ["$requester", 0] },
+                  },
+                },
+              },
+            },
+            {
+              $project: {
+                "user.password": 0,
+              },
+            },
+          ])
+          .toArray();
+
+        res.send({
+          success: true,
+          friends,
+        });
+      } catch (error) {
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // **WEB SOCKET ENABLED MESSAGING APIs**
+
+    // Get or create conversation by participant
+    app.get("/conversations/participant/:participantId", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const participantId = req.params.participantId;
+
+        // Check if conversation already exists
+        const existingConversation = await conversationsCollection.findOne({
+          participants: {
+            $all: [new ObjectId(userId), new ObjectId(participantId)]
+          }
+        });
+
+        if (existingConversation) {
+          // Get participant details
+          const participant = await usersCollection.findOne(
+            { _id: new ObjectId(participantId) },
+            { projection: { password: 0, email: 0 } }
+          );
+
+          return res.send({
+            success: true,
+            conversation: {
+              ...existingConversation,
+              participant: participant
+            },
+            message: "Conversation found"
+          });
         }
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "requesterId",
-          foreignField: "_id",
-          as: "requester"
+
+        // Create new conversation
+        const newConversation = {
+          participants: [new ObjectId(userId), new ObjectId(participantId)],
+          unreadCounts: [
+            { userId: new ObjectId(userId), count: 0 },
+            { userId: new ObjectId(participantId), count: 0 }
+          ],
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const result = await conversationsCollection.insertOne(newConversation);
+        const participant = await usersCollection.findOne(
+          { _id: new ObjectId(participantId) },
+          { projection: { password: 0, email: 0 } }
+        );
+
+        res.status(201).send({
+          success: true,
+          conversation: {
+            _id: result.insertedId,
+            ...newConversation,
+            participant: participant
+          },
+          message: "New conversation created"
+        });
+      } catch (error) {
+        console.error("Error getting conversation:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    app.post("/conversations", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { participantId } = req.body;
+
+        if (!participantId) {
+          return res.status(400).send({ message: "Participant ID is required" });
         }
-      },
-      {
-        $lookup: {
-          from: "users",
-          localField: "recipientId",
-          foreignField: "_id",
-          as: "recipient"
+
+        // Check if conversation already exists
+        const existingConversation = await conversationsCollection.findOne({
+          participants: {
+            $all: [new ObjectId(userId), new ObjectId(participantId)]
+          }
+        });
+
+        if (existingConversation) {
+          return res.send({
+            success: true,
+            conversation: existingConversation,
+            message: "Conversation already exists"
+          });
         }
-      },
-      {
-        $project: {
-          user: {
-            $cond: {
-              if: { $eq: ["$requesterId", new ObjectId(userId)] },
-              then: { $arrayElemAt: ["$recipient", 0] },
-              else: { $arrayElemAt: ["$requester", 0] }
+
+        // Create new conversation
+        const newConversation = {
+          participants: [new ObjectId(userId), new ObjectId(participantId)],
+          unreadCounts: [
+            { userId: new ObjectId(userId), count: 0 },
+            { userId: new ObjectId(participantId), count: 0 }
+          ],
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const result = await conversationsCollection.insertOne(newConversation);
+
+        res.status(201).send({
+          success: true,
+          conversation: { _id: result.insertedId, ...newConversation },
+          message: "New conversation created"
+        });
+      } catch (error) {
+        console.error("Error creating conversation:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // Get user's conversations
+    app.get("/conversations", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const conversations = await conversationsCollection
+          .aggregate([
+            {
+              $match: {
+                participants: new ObjectId(userId)
+              }
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "participants",
+                foreignField: "_id",
+                as: "participantsData"
+              }
+            },
+            {
+              $project: {
+                "participantsData.password": 0,
+                "participantsData.email": 0
+              }
+            }
+          ])
+          .toArray();
+
+        // Format response to show other participant
+        const formattedConversations = conversations.map(conv => {
+          const otherParticipant = conv.participantsData.find(
+            p => p._id.toString() !== userId
+          );
+          
+          return {
+            _id: conv._id,
+            participant: otherParticipant,
+            lastMessage: conv.lastMessage,
+            lastMessageAt: conv.lastMessageAt,
+            unreadCounts: conv.unreadCounts,
+            createdAt: conv.createdAt,
+            updatedAt: conv.updatedAt
+          };
+        });
+
+        res.send({
+          success: true,
+          conversations: formattedConversations
+        });
+      } catch (error) {
+        console.error("Error fetching conversations:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // Send message with WebSocket
+    app.post("/messages", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { conversationId, content, type = "text" } = req.body;
+
+        if (!conversationId || !content) {
+          return res.status(400).send({ 
+            message: "Conversation ID and content are required" 
+          });
+        }
+
+        // Verify user is part of the conversation
+        const conversation = await conversationsCollection.findOne({
+          _id: new ObjectId(conversationId),
+          participants: new ObjectId(userId)
+        });
+
+        if (!conversation) {
+          return res.status(403).send({ message: "Not authorized for this conversation" });
+        }
+
+        const newMessage = {
+          conversationId: new ObjectId(conversationId),
+          senderId: new ObjectId(userId),
+          content,
+          type,
+          readBy: [new ObjectId(userId)],
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const result = await messagesCollection.insertOne(newMessage);
+
+        // Get other participants
+        const otherParticipants = conversation.participants.filter(
+          participant => participant.toString() !== userId
+        );
+
+        // Update conversation
+        await conversationsCollection.updateOne(
+          { _id: new ObjectId(conversationId) },
+          { 
+            $set: { 
+              lastMessage: content,
+              lastMessageAt: new Date(),
+              updatedAt: new Date()
             }
           }
-        }
-      },
-      {
-        $project: {
-          "user.password": 0
-        }
-      }
-    ]).toArray();
+        );
 
-    res.send({
-      success: true,
-      friends
+        // Increment unread counts for other participants
+        for (const participantId of otherParticipants) {
+          await conversationsCollection.updateOne(
+            { 
+              _id: new ObjectId(conversationId),
+              "unreadCounts.userId": new ObjectId(participantId)
+            },
+            { 
+              $inc: { "unreadCounts.$.count": 1 } 
+            }
+          );
+        }
+
+        // Get the created message with sender details
+        const message = await messagesCollection
+          .aggregate([
+            { $match: { _id: result.insertedId } },
+            {
+              $lookup: {
+                from: "users",
+                localField: "senderId",
+                foreignField: "_id",
+                as: "sender"
+              }
+            },
+            { $unwind: "$sender" },
+            {
+              $project: {
+                "sender.password": 0,
+                "sender.email": 0
+              }
+            }
+          ])
+          .toArray();
+
+        const messageData = message[0];
+
+        // **WEB SOCKET EMISSION**
+        io.to(conversationId).emit('new_message', {
+          conversationId,
+          message: messageData
+        });
+
+        // Send push notification to offline users
+        otherParticipants.forEach(participantId => {
+          const isOnline = activeUsers.has(participantId.toString());
+          if (!isOnline) {
+            console.log(`User ${participantId} is offline, would send push notification`);
+          }
+        });
+
+        res.status(201).send({
+          success: true,
+          message: messageData
+        });
+      } catch (error) {
+        console.error("Error sending message:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
     });
-  } catch (error) {
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
+
+    // Get messages for a conversation
+    app.get("/conversations/:conversationId/messages", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const conversationId = req.params.conversationId;
+        const { page = 1, limit = 50 } = req.query;
+        const skip = (page - 1) * parseInt(limit);
+
+        // Verify user is part of the conversation
+        const conversation = await conversationsCollection.findOne({
+          _id: new ObjectId(conversationId),
+          participants: new ObjectId(userId)
+        });
+
+        if (!conversation) {
+          return res.status(403).send({ message: "Not authorized for this conversation" });
+        }
+
+        const messages = await messagesCollection
+          .aggregate([
+            { 
+              $match: { 
+                conversationId: new ObjectId(conversationId) 
+              } 
+            },
+            {
+              $lookup: {
+                from: "users",
+                localField: "senderId",
+                foreignField: "_id",
+                as: "sender"
+              }
+            },
+            { $unwind: "$sender" },
+            {
+              $project: {
+                "sender.password": 0,
+                "sender.email": 0
+              }
+            },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: parseInt(limit) }
+          ])
+          .toArray();
+
+        // Mark messages as read when fetched
+        await messagesCollection.updateMany(
+          {
+            conversationId: new ObjectId(conversationId),
+            senderId: { $ne: new ObjectId(userId) },
+            readBy: { $ne: new ObjectId(userId) }
+          },
+          {
+            $push: { readBy: new ObjectId(userId) }
+          }
+        );
+
+        // Reset unread count for this user
+        await conversationsCollection.updateOne(
+          {
+            _id: new ObjectId(conversationId),
+            "unreadCounts.userId": new ObjectId(userId)
+          },
+          {
+            $set: { "unreadCounts.$.count": 0 }
+          }
+        );
+
+        res.send({
+          success: true,
+          messages: messages.reverse(),
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total: await messagesCollection.countDocuments({ 
+              conversationId: new ObjectId(conversationId) 
+            })
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching messages:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // Mark messages as read
+    app.put("/conversations/:conversationId/read", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const conversationId = req.params.conversationId;
+
+        // Mark all messages as read
+        await messagesCollection.updateMany(
+          {
+            conversationId: new ObjectId(conversationId),
+            senderId: { $ne: new ObjectId(userId) },
+            readBy: { $ne: new ObjectId(userId) }
+          },
+          {
+            $push: { readBy: new ObjectId(userId) }
+          }
+        );
+
+        // Reset unread count
+        await conversationsCollection.updateOne(
+          {
+            _id: new ObjectId(conversationId),
+            "unreadCounts.userId": new ObjectId(userId)
+          },
+          {
+            $set: { "unreadCounts.$.count": 0 }
+          }
+        );
+
+        // Notify other participants via WebSocket
+        io.to(conversationId).emit('messages_read', {
+          conversationId,
+          readBy: userId,
+          readAt: new Date()
+        });
+
+        res.send({
+          success: true,
+          message: "Messages marked as read"
+        });
+      } catch (error) {
+        console.error("Error marking messages as read:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
+    // Get online status of users
+    app.get("/users/online-status/:userId", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.params.userId;
+        const isOnline = activeUsers.has(userId);
+        
+        res.send({
+          success: true,
+          isOnline,
+          lastSeen: isOnline ? new Date() : null
+        });
+      } catch (error) {
+        console.error("Error getting online status:", error);
+        res.status(500).send({ message: "Server error", error: error.message });
+      }
+    });
+
     app.delete("/stories/:id", VerifyToken, async (req, res) => {
       try {
         const storyId = req.params.id;
@@ -1168,34 +2881,39 @@ app.get("/friends", VerifyToken, async (req, res) => {
 
         const story = await storiesCollection.findOne({
           _id: new ObjectId(storyId),
-          userId: new ObjectId(userId)
+          userId: new ObjectId(userId),
         });
 
         if (!story) {
-          return res.status(404).send({ message: "Story not found or unauthorized" });
+          return res
+            .status(404)
+            .send({ message: "Story not found or unauthorized" });
         }
 
         await storiesCollection.deleteOne({ _id: new ObjectId(storyId) });
 
         res.send({
           success: true,
-          message: "Story deleted successfully"
+          message: "Story deleted successfully",
         });
       } catch (error) {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
-
   } finally {
     // Client connection will remain open
   }
 }
+
 run().catch(console.dir);
 
 app.get("/", async (req, res) => {
-  res.send("Social Media API Server is running!");
+  res.send("Social Media API Server is running with WebSocket!");
 });
 
-app.listen(port, () => {
+// Use server.listen instead of app.listen
+server.listen(port, () => {
   console.log(`Server is running on port: ${port}`);
+  console.log(`WebSocket server is also running on port: ${port}`);
+  console.log(`Real-time notifications are enabled via WebSocket`);
 });
