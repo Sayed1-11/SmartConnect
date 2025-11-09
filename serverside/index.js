@@ -15,16 +15,17 @@ const { Server } = require('socket.io');
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:8081"],
+    origin: ["http://localhost:8081", "http://localhost:19006", "http://localhost:3000"],
     credentials: true,
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   }
 });
 
 // Middleware
 app.use(
   cors({
-    origin: ["http://localhost:8081"],
+    origin: ["http://localhost:8081", "http://localhost:19006", "http://localhost:3000"],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -59,8 +60,9 @@ const client = new MongoClient(uri, {
 // Store active users and their socket connections
 const activeUsers = new Map(); // userId -> socketId
 const userSockets = new Map(); // socketId -> userId
+const activeCalls = new Map(); // callId -> call data
 
-let usersCollection, postsCollection, storiesCollection, friendsCollection, notificationsCollection, conversationsCollection, messagesCollection;
+let usersCollection, postsCollection,reelsCollection, videosCollection, storiesCollection, friendsCollection, notificationsCollection, conversationsCollection, messagesCollection;
 
 // Notification Types
 const NOTIFICATION_TYPES = {
@@ -71,7 +73,13 @@ const NOTIFICATION_TYPES = {
   FRIEND_REQUEST: 'friend_request',
   FRIEND_REQUEST_ACCEPTED: 'friend_request_accepted',
   MENTION: 'mention',
-  TAG: 'tag'
+  TAG: 'tag',
+  INCOMING_CALL: 'incoming_call',
+  MISSED_CALL: 'missed_call',
+  NEW_VIDEO: 'new_video',
+  REEL_LIKE: 'reel_like',
+  REEL_COMMENT: 'reel_comment',
+  REEL_SHARE: 'reel_share'
 };
 
 // Enhanced Create a notification (utility function) with WebSocket support
@@ -213,6 +221,62 @@ async function createPostInteractionNotification(interactionData) {
   return await createNotification(notificationData);
 }
 
+// Helper function to get user info
+async function getUserInfo(userId) {
+  try {
+    const user = await usersCollection.findOne(
+      { _id: new ObjectId(userId) },
+      { projection: { name: 1, profilePicture: 1, username: 1, email: 1 } }
+    );
+    return user;
+  } catch (error) {
+    console.error('Error getting user info:', error);
+    return null;
+  }
+}
+
+// Helper function to create call record in database
+async function createCallRecord(callData) {
+  try {
+    const callRecord = {
+      callId: callData.callId,
+      callerId: new ObjectId(callData.callerId),
+      recipientId: new ObjectId(callData.recipientId),
+      callType: callData.callType,
+      conversationId: callData.conversationId ? new ObjectId(callData.conversationId) : null,
+      status: callData.status,
+      participants: callData.participants.map(id => new ObjectId(id)),
+      startedAt: callData.createdAt,
+      endedAt: null,
+      duration: 0,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // If you have a calls collection, insert it here
+    // await callsCollection.insertOne(callRecord);
+    
+    return callRecord;
+  } catch (error) {
+    console.error('Error creating call record:', error);
+    return null;
+  }
+}
+
+// Helper function to update call record
+async function updateCallRecord(callId, updateData) {
+  try {
+    // If you have a calls collection, update it here
+    // await callsCollection.updateOne(
+    //   { callId: callId },
+    //   { $set: updateData }
+    // );
+    console.log(`Call ${callId} updated:`, updateData);
+  } catch (error) {
+    console.error('Error updating call record:', error);
+  }
+}
+
 // Socket.IO authentication middleware
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -260,6 +324,345 @@ function initializeWebSocketHandlers() {
     };
 
     joinUserConversations();
+
+    // Notify that user is online
+    socket.broadcast.emit('user_status_change', {
+      userId: socket.userId,
+      isOnline: true,
+      lastSeen: new Date()
+    });
+
+    // **WEBRTC CALL HANDLERS**
+
+    // Initiate a call
+    socket.on('call_initiate', async (data) => {
+      try {
+        const { recipientId, callType, conversationId } = data;
+        
+        console.log(`Call initiated: ${callType} from ${socket.userId} to ${recipientId}`);
+        
+        // Check if recipient is online
+        const recipientSocketId = activeUsers.get(recipientId);
+        
+        if (recipientSocketId) {
+          // Create call data
+          const callId = `call_${Date.now()}_${socket.userId}`;
+          const callData = {
+            callId: callId,
+            callerId: socket.userId,
+            recipientId: recipientId,
+            callType: callType, // 'audio' or 'video'
+            conversationId: conversationId,
+            status: 'ringing',
+            createdAt: new Date(),
+            participants: [socket.userId]
+          };
+          
+          // Store call data
+          activeCalls.set(callId, callData);
+          
+          // Create call record in database
+          await createCallRecord(callData);
+          
+          // Get caller info
+          const callerInfo = await getUserInfo(socket.userId);
+          
+          // Emit to recipient
+          io.to(recipientId).emit('incoming_call', {
+            ...callData,
+            callerInfo: callerInfo
+          });
+          
+          // Confirm to caller that call was initiated
+          socket.emit('call_initiated', {
+            callId: callId,
+            recipientOnline: true
+          });
+          
+          console.log(`Incoming call sent to ${recipientId}`);
+          
+          // Create missed call notification if call isn't answered
+          const missedCallTimeout = setTimeout(async () => {
+            const currentCall = activeCalls.get(callId);
+            if (currentCall && currentCall.status === 'ringing') {
+              console.log(`Call ${callId} timed out`);
+              
+              // Create missed call notification
+              await createNotification({
+                type: NOTIFICATION_TYPES.MISSED_CALL,
+                senderId: new ObjectId(socket.userId),
+                recipientId: new ObjectId(recipientId),
+                message: 'missed your call',
+                metadata: {
+                  callId: callId,
+                  callType: callType,
+                  conversationId: conversationId
+                }
+              });
+              
+              // Notify both parties
+              io.to(socket.userId).emit('call_rejected', {
+                callId: callId,
+                recipientId: recipientId,
+                reason: 'Call timed out'
+              });
+              
+              io.to(recipientId).emit('call_ended', {
+                callId: callId,
+                endedBy: 'system',
+                reason: 'Call timed out'
+              });
+              
+              // Update call record
+              await updateCallRecord(callId, {
+                status: 'missed',
+                endedAt: new Date(),
+                updatedAt: new Date()
+              });
+              
+              // Remove from active calls
+              activeCalls.delete(callId);
+            }
+          }, 45000); // 45 seconds timeout
+          
+          // Store timeout reference in call data
+          callData.missedCallTimeout = missedCallTimeout;
+          activeCalls.set(callId, callData);
+          
+        } else {
+          // Recipient is offline
+          socket.emit('call_failed', {
+            reason: 'recipient_offline',
+            message: 'User is currently offline'
+          });
+          
+          // Create missed call notification
+          await createNotification({
+            type: NOTIFICATION_TYPES.MISSED_CALL,
+            senderId: new ObjectId(socket.userId),
+            recipientId: new ObjectId(recipientId),
+            message: 'called you',
+            metadata: {
+              callId: `missed_${Date.now()}`,
+              callType: callType,
+              conversationId: conversationId
+            }
+          });
+        }
+      } catch (error) {
+        console.error('Error initiating call:', error);
+        socket.emit('call_failed', {
+          reason: 'server_error',
+          message: 'Failed to initiate call'
+        });
+      }
+    });
+
+    // Accept a call
+    socket.on('call_accept', async (data) => {
+      try {
+        const { callId } = data;
+        
+        console.log(`Call ${callId} accepted by ${socket.userId}`);
+        
+        const callData = activeCalls.get(callId);
+        if (!callData) {
+          socket.emit('call_error', {
+            message: 'Call not found'
+          });
+          return;
+        }
+        
+        // Clear the missed call timeout
+        if (callData.missedCallTimeout) {
+          clearTimeout(callData.missedCallTimeout);
+        }
+        
+        // Update call status
+        callData.status = 'active';
+        callData.answeredAt = new Date();
+        callData.participants.push(socket.userId);
+        activeCalls.set(callId, callData);
+        
+        // Update call record
+        await updateCallRecord(callId, {
+          status: 'active',
+          answeredAt: new Date(),
+          updatedAt: new Date()
+        });
+        
+        // Get recipient info
+        const recipientInfo = await getUserInfo(socket.userId);
+        
+        // Notify the caller that call was accepted
+        io.to(callData.callerId).emit('call_accepted', {
+          callId: callId,
+          recipientId: socket.userId,
+          recipientInfo: recipientInfo
+        });
+        
+        console.log(`Call ${callId} accepted successfully`);
+        
+      } catch (error) {
+        console.error('Error accepting call:', error);
+        socket.emit('call_error', {
+          message: 'Failed to accept call'
+        });
+      }
+    });
+
+    // Reject a call
+    socket.on('call_reject', async (data) => {
+      const { callId, reason } = data;
+      
+      console.log(`Call ${callId} rejected by ${socket.userId}, reason: ${reason}`);
+      
+      const callData = activeCalls.get(callId);
+      if (!callData) return;
+      
+      // Clear the missed call timeout
+      if (callData.missedCallTimeout) {
+        clearTimeout(callData.missedCallTimeout);
+      }
+      
+      // Update call record
+      await updateCallRecord(callId, {
+        status: 'rejected',
+        endedAt: new Date(),
+        reason: reason,
+        updatedAt: new Date()
+      });
+      
+      // Notify the caller
+      io.to(callData.callerId).emit('call_rejected', {
+        callId: callId,
+        recipientId: socket.userId,
+        reason: reason || 'Call rejected'
+      });
+      
+      // Remove from active calls
+      activeCalls.delete(callId);
+    });
+
+    // End a call
+    socket.on('call_end', async (data) => {
+      const { callId, reason } = data;
+      
+      console.log(`Call ${callId} ended by ${socket.userId}`);
+      
+      const callData = activeCalls.get(callId);
+      if (!callData) return;
+      
+      // Calculate call duration
+      const duration = callData.answeredAt ? 
+        Date.now() - callData.answeredAt.getTime() : 0;
+      
+      // Update call record
+      await updateCallRecord(callId, {
+        status: 'ended',
+        endedAt: new Date(),
+        duration: duration,
+        reason: reason,
+        updatedAt: new Date()
+      });
+      
+      // Notify all participants
+      callData.participants.forEach(participantId => {
+        io.to(participantId).emit('call_ended', {
+          callId: callId,
+          endedBy: socket.userId,
+          reason: reason || 'Call ended',
+          duration: duration
+        });
+      });
+      
+      // Remove from active calls
+      activeCalls.delete(callId);
+    });
+
+    // WebRTC signaling: offer
+    socket.on('webrtc_offer', (data) => {
+      const { callId, offer, recipientId } = data;
+      
+      console.log(`WebRTC offer for call ${callId}`);
+      
+      const callData = activeCalls.get(callId);
+      if (!callData) {
+        socket.emit('call_error', { message: 'Call not found' });
+        return;
+      }
+      
+      // Forward the offer to the recipient
+      io.to(recipientId).emit('webrtc_offer', {
+        callId: callId,
+        offer: offer,
+        callerId: socket.userId
+      });
+    });
+
+    // WebRTC signaling: answer
+    socket.on('webrtc_answer', (data) => {
+      const { callId, answer, recipientId } = data;
+      
+      console.log(`WebRTC answer for call ${callId}`);
+      
+      const callData = activeCalls.get(callId);
+      if (!callData) {
+        socket.emit('call_error', { message: 'Call not found' });
+        return;
+      }
+      
+      // Forward the answer to the recipient
+      io.to(recipientId).emit('webrtc_answer', {
+        callId: callId,
+        answer: answer,
+        answererId: socket.userId
+      });
+    });
+
+    // WebRTC signaling: ice candidate
+    socket.on('webrtc_ice_candidate', (data) => {
+      const { callId, candidate, recipientId } = data;
+      
+      const callData = activeCalls.get(callId);
+      if (!callData) {
+        socket.emit('call_error', { message: 'Call not found' });
+        return;
+      }
+      
+      // Forward the ICE candidate to the recipient
+      io.to(recipientId).emit('webrtc_ice_candidate', {
+        callId: callId,
+        candidate: candidate,
+        senderId: socket.userId
+      });
+    });
+
+    // Get active call info
+    socket.on('get_call_info', (data) => {
+      const { callId } = data;
+      const callData = activeCalls.get(callId);
+      
+      socket.emit('call_info', {
+        callId: callId,
+        callData: callData
+      });
+    });
+
+    // Check if user is in a call
+    socket.on('check_active_call', () => {
+      let userActiveCall = null;
+      activeCalls.forEach((callData, callId) => {
+        if (callData.participants.includes(socket.userId)) {
+          userActiveCall = { callId, ...callData };
+        }
+      });
+      
+      socket.emit('active_call_status', {
+        hasActiveCall: !!userActiveCall,
+        callData: userActiveCall
+      });
+    });
 
     // **NOTIFICATION WEB SOCKET EVENTS**
 
@@ -526,18 +929,42 @@ function initializeWebSocketHandlers() {
       }
     });
 
-    // Handle user online status
-    socket.on('user_online', () => {
-      socket.broadcast.emit('user_status_change', {
-        userId: socket.userId,
-        isOnline: true,
-        lastSeen: new Date()
-      });
-    });
-
     // Handle disconnect
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
       console.log('User disconnected:', socket.userId);
+      
+      // End all active calls for this user
+      activeCalls.forEach(async (callData, callId) => {
+        if (callData.participants.includes(socket.userId)) {
+          // Calculate call duration
+          const duration = callData.answeredAt ? 
+            Date.now() - callData.answeredAt.getTime() : 0;
+          
+          // Update call record
+          await updateCallRecord(callId, {
+            status: 'ended',
+            endedAt: new Date(),
+            duration: duration,
+            reason: 'User disconnected',
+            updatedAt: new Date()
+          });
+          
+          // Notify other participants
+          callData.participants.forEach(participantId => {
+            if (participantId !== socket.userId) {
+              io.to(participantId).emit('call_ended', {
+                callId: callId,
+                endedBy: 'system',
+                reason: 'User disconnected',
+                duration: duration
+              });
+            }
+          });
+          
+          // Remove from active calls
+          activeCalls.delete(callId);
+        }
+      });
       
       activeUsers.delete(socket.userId);
       userSockets.delete(socket.id);
@@ -581,7 +1008,8 @@ async function run() {
     notificationsCollection = database.collection("notifications");
     conversationsCollection = database.collection("conversations");
     messagesCollection = database.collection("messages");
-
+    reelsCollection = database.collection("reels");
+    videosCollection = database.collection("videos");
     console.log("Database collections initialized successfully");
 
     // Initialize WebSocket handlers after collections are ready
@@ -1017,6 +1445,102 @@ async function run() {
       }
     });
 
+    // Call History APIs
+    app.get("/calls/history", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { page = 1, limit = 20 } = req.query;
+        const skip = (page - 1) * parseInt(limit);
+
+        // If you have a calls collection, use this:
+        /*
+        const calls = await callsCollection
+          .find({
+            participants: new ObjectId(userId)
+          })
+          .sort({ startedAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await callsCollection.countDocuments({
+          participants: new ObjectId(userId)
+        });
+        */
+
+        // For now, return empty array since we don't have calls collection
+        const calls = [];
+        const total = 0;
+
+        res.send({
+          success: true,
+          calls,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching call history:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while fetching call history",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get active calls for user
+    app.get("/calls/active", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const userActiveCalls = [];
+
+        activeCalls.forEach((callData, callId) => {
+          if (callData.participants.includes(userId)) {
+            userActiveCalls.push({ callId, ...callData });
+          }
+        });
+
+        res.send({
+          success: true,
+          activeCalls: userActiveCalls
+        });
+      } catch (error) {
+        console.error("Error fetching active calls:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get online users
+    app.get("/users/online", VerifyToken, async (req, res) => {
+      try {
+        const onlineUsers = [];
+        
+        activeUsers.forEach((socketId, userId) => {
+          onlineUsers.push(userId);
+        });
+
+        res.send({
+          success: true,
+          onlineUsers,
+          count: onlineUsers.length
+        });
+      } catch (error) {
+        console.error("Error fetching online users:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
     // JWT posting
     app.post("/jwt", async (req, res) => {
       const user = req.body;
@@ -1052,6 +1576,41 @@ async function run() {
         next();
       });
     }
+app.get("/status", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const isOnline = activeUsers.has(userId);
+        
+        let userActiveCall = null;
+        activeCalls.forEach((callData, callId) => {
+          if (callData.participants.includes(userId)) {
+            userActiveCall = { callId, ...callData };
+          }
+        });
+
+        res.send({
+          success: true,
+          user: {
+            id: userId,
+            isOnline: isOnline,
+            hasActiveCall: !!userActiveCall
+          },
+          server: {
+            activeCalls: activeCalls.size,
+            onlineUsers: activeUsers.size,
+            uptime: process.uptime()
+          }
+        });
+      } catch (error) {
+        console.error("Error getting server status:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
 
     app.post("/upload", VerifyToken, async (req, res) => {
       try {
@@ -1143,7 +1702,923 @@ async function run() {
       }
     });
 
-    app.post("/logout", VerifyToken, (req, res) => {
+app.post("/upload/video", VerifyToken, async (req, res) => {
+  try {
+    const { video, thumbnail, caption, duration, aspectRatio } = req.body;
+    const userId = req.user.userId;
+
+    if (!video) {
+      return res.status(400).send({
+        success: false,
+        message: "No video data provided",
+      });
+    }
+
+    console.log("Processing video upload to MongoDB...");
+
+    // Validate video data
+    if (!video.startsWith("data:video/")) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid video format. Expected base64 video data.",
+      });
+    }
+
+    // Extract base64 data and metadata
+    const videoMatch = video.match(/^data:video\/(\w+);base64,(.+)$/);
+    if (!videoMatch) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid video base64 format",
+      });
+    }
+
+    const videoFormat = videoMatch[1]; // mp4, mov, etc.
+    const base64Data = videoMatch[2];
+    
+    // Calculate video size
+    const videoSizeInBytes = (base64Data.length * 3) / 4;
+
+    // Validate video size (max 50MB for videos)
+    if (videoSizeInBytes > 50 * 1024 * 1024) {
+      return res.status(413).send({
+        success: false,
+        message: "Video too large. Maximum size is 50MB.",
+      });
+    }
+
+    console.log(`Video details - Format: ${videoFormat}, Size: ${(videoSizeInBytes / 1024 / 1024).toFixed(2)}MB`);
+
+    // Handle thumbnail if provided
+    let thumbnailBase64 = null;
+    let thumbnailFormat = null;
+    
+    if (thumbnail && thumbnail.startsWith("data:image/")) {
+      const thumbMatch = thumbnail.match(/^data:image\/(\w+);base64,(.+)$/);
+      if (thumbMatch) {
+        thumbnailFormat = thumbMatch[1];
+        thumbnailBase64 = thumbMatch[2];
+      }
+    }
+
+    // Save video metadata to database with base64 data
+    const videoMetadata = {
+      userId: new ObjectId(userId),
+      videoData: base64Data, // Store base64 video data directly
+      videoFormat: videoFormat,
+      thumbnail: thumbnailBase64, // Store base64 thumbnail data
+      thumbnailFormat: thumbnailFormat,
+      caption: caption || "",
+      duration: duration || 0,
+      aspectRatio: aspectRatio || "9:16",
+      size: videoSizeInBytes,
+      likes: [],
+      comments: [],
+      shares: 0,
+      views: 0,
+      privacy: "public",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await videosCollection.insertOne(videoMetadata);
+
+    // Create notification for followers about new video
+    const followers = await friendsCollection.find({
+      $or: [
+        { requesterId: new ObjectId(userId), status: "accepted" },
+        { recipientId: new ObjectId(userId), status: "accepted" },
+      ],
+    }).toArray();
+
+    const followerIds = followers.map(f => 
+      f.requesterId.toString() === userId ? f.recipientId : f.requesterId
+    );
+
+    // Create notifications for followers
+    for (const followerId of followerIds) {
+      await createNotification({
+        type: NOTIFICATION_TYPES.NEW_VIDEO,
+        senderId: new ObjectId(userId),
+        recipientId: followerId,
+        message: "uploaded a new video",
+        metadata: {
+          videoId: result.insertedId,
+        }
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Video uploaded successfully to database",
+      video: {
+        id: result.insertedId,
+        duration,
+        aspectRatio,
+        size: videoSizeInBytes,
+        format: videoFormat,
+      },
+    });
+  } catch (error) {
+    console.error("Error uploading video to database:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error during video upload",
+      error: error.message,
+    });
+  }
+});
+// Stream video from MongoDB
+app.get("/videos/:videoId/stream", VerifyToken, async (req, res) => {
+  try {
+    const videoId = req.params.videoId;
+    const userId = req.user.userId;
+
+    // Find video in database
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId)
+    });
+
+    if (!video) {
+      return res.status(404).send({
+        success: false,
+        message: "Video not found"
+      });
+    }
+
+    // Check privacy settings
+    if (video.privacy === 'private' && video.userId.toString() !== userId) {
+      return res.status(403).send({
+        success: false,
+        message: "Access denied"
+      });
+    }
+
+    if (video.privacy === 'friends') {
+      const isFriend = await friendsCollection.findOne({
+        $or: [
+          { requesterId: new ObjectId(userId), recipientId: video.userId, status: "accepted" },
+          { requesterId: video.userId, recipientId: new ObjectId(userId), status: "accepted" },
+        ],
+      });
+
+      if (!isFriend && video.userId.toString() !== userId) {
+        return res.status(403).send({
+          success: false,
+          message: "Access denied"
+        });
+      }
+    }
+
+    // Convert base64 back to buffer
+    const videoBuffer = Buffer.from(video.videoData, 'base64');
+    
+    // Set appropriate headers
+    res.setHeader('Content-Type', `video/${video.videoFormat}`);
+    res.setHeader('Content-Length', videoBuffer.length);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+
+    // Handle range requests for video streaming
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : videoBuffer.length - 1;
+      const chunksize = (end - start) + 1;
+
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${videoBuffer.length}`,
+        'Content-Length': chunksize,
+      });
+
+      res.end(videoBuffer.slice(start, end + 1));
+    } else {
+      res.end(videoBuffer);
+    }
+
+    // Increment view count
+    await videosCollection.updateOne(
+      { _id: new ObjectId(videoId) },
+      { $inc: { views: 1 } }
+    );
+
+  } catch (error) {
+    console.error("Error streaming video:", error);
+    res.status(500).send({
+      success: false,
+      message: "Error streaming video",
+      error: error.message
+    });
+  }
+});
+
+
+// Serve thumbnail from MongoDB
+app.get("/videos/:videoId/thumbnail", VerifyToken, async (req, res) => {
+  try {
+    const videoId = req.params.videoId;
+    const userId = req.user.userId;
+
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId)
+    });
+
+    if (!video || !video.thumbnail) {
+      return res.status(404).send({
+        success: false,
+        message: "Thumbnail not found"
+      });
+    }
+
+    // Check privacy (same logic as video streaming)
+    if (video.privacy === 'private' && video.userId.toString() !== userId) {
+      return res.status(403).send({
+        success: false,
+        message: "Access denied"
+      });
+    }
+
+    if (video.privacy === 'friends') {
+      const isFriend = await friendsCollection.findOne({
+        $or: [
+          { requesterId: new ObjectId(userId), recipientId: video.userId, status: "accepted" },
+          { requesterId: video.userId, recipientId: new ObjectId(userId), status: "accepted" },
+        ],
+      });
+
+      if (!isFriend && video.userId.toString() !== userId) {
+        return res.status(403).send({
+          success: false,
+          message: "Access denied"
+        });
+      }
+    }
+
+    const thumbBuffer = Buffer.from(video.thumbnail, 'base64');
+    
+    res.setHeader('Content-Type', `image/${video.thumbnailFormat || 'jpeg'}`);
+    res.setHeader('Content-Length', thumbBuffer.length);
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+
+    res.end(thumbBuffer);
+
+  } catch (error) {
+    console.error("Error serving thumbnail:", error);
+    res.status(500).send({
+      success: false,
+      message: "Error serving thumbnail",
+      error: error.message
+    });
+  }
+});
+// Create Reel API
+app.post("/reels", VerifyToken, async (req, res) => {
+  try {
+    const { videoId, caption, music, effects } = req.body;
+    const userId = req.user.userId;
+
+    // Verify video exists and belongs to user
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!video) {
+      return res.status(404).send({
+        success: false,
+        message: "Video not found or unauthorized",
+      });
+    }
+
+    // Create reel
+    const newReel = {
+      userId: new ObjectId(userId),
+      videoId: new ObjectId(videoId),
+      caption: caption || "",
+      music: music || null,
+      effects: effects || [],
+      likes: [],
+      comments: [],
+      shares: 0,
+      views: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await reelsCollection.insertOne(newReel);
+
+    // Get complete reel with user and video data
+    const reel = await reelsCollection.aggregate([
+      { $match: { _id: result.insertedId } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "user",
+        },
+      },
+      { $unwind: "$user" },
+      {
+        $lookup: {
+          from: "videos",
+          localField: "videoId",
+          foreignField: "_id",
+          as: "video",
+        },
+      },
+      { $unwind: "$video" },
+      {
+        $project: {
+          "user.password": 0,
+          "user.email": 0,
+        },
+      },
+    ]).next();
+
+    res.status(201).send({
+      success: true,
+      message: "Reel created successfully",
+      reel,
+    });
+  } catch (error) {
+    console.error("Error creating reel:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while creating reel",
+      error: error.message,
+    });
+  }
+});
+
+// Get Reels Feed
+// Create Reel API - Updated for MongoDB storage
+app.post("/reels", VerifyToken, async (req, res) => {
+  try {
+    const { videoId, caption, music, effects } = req.body;
+    const userId = req.user.userId;
+
+    // Verify video exists and belongs to user
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!video) {
+      return res.status(404).send({
+        success: false,
+        message: "Video not found or unauthorized",
+      });
+    }
+
+    // Create reel with video URL pointing to our streaming endpoint
+    const newReel = {
+      userId: new ObjectId(userId),
+      videoId: new ObjectId(videoId),
+      videoUrl: `/videos/${videoId}/stream`, // Use our streaming endpoint
+      thumbnailUrl: `/videos/${videoId}/thumbnail`, // Use our thumbnail endpoint
+      caption: caption || "",
+      music: music || null,
+      effects: effects || [],
+      duration: video.duration,
+      aspectRatio: video.aspectRatio,
+      likes: [],
+      comments: [],
+      shares: 0,
+      views: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await reelsCollection.insertOne(newReel);
+
+    // Get complete reel with user and video data
+    const reel = await reelsCollection.aggregate([
+      { $match: { _id: result.insertedId } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "user",
+        },
+      },
+      { $unwind: "$user" },
+      {
+        $lookup: {
+          from: "videos",
+          localField: "videoId",
+          foreignField: "_id",
+          as: "video",
+        },
+      },
+      { $unwind: "$video" },
+      {
+        $project: {
+          "user.password": 0,
+          "user.email": 0,
+          "video.videoData": 0, // Don't send large video data
+          "video.thumbnail": 0, // Don't send thumbnail data
+        },
+      },
+    ]).next();
+
+    res.status(201).send({
+      success: true,
+      message: "Reel created successfully",
+      reel,
+    });
+  } catch (error) {
+    console.error("Error creating reel:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while creating reel",
+      error: error.message,
+    });
+  }
+});
+// Cleanup old videos (run periodically)
+app.delete("/videos/cleanup", VerifyToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { olderThanDays = 30 } = req.body;
+
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
+
+    // Delete videos older than specified days
+    const result = await videosCollection.deleteMany({
+      userId: new ObjectId(userId),
+      createdAt: { $lt: cutoffDate }
+    });
+
+    res.send({
+      success: true,
+      message: `Cleaned up ${result.deletedCount} old videos`,
+      deletedCount: result.deletedCount
+    });
+  } catch (error) {
+    console.error("Error cleaning up videos:", error);
+    res.status(500).send({
+      success: false,
+      message: "Error cleaning up videos",
+      error: error.message
+    });
+  }
+});
+// Get Trending Reels
+app.get("/reels/trending", VerifyToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (page - 1) * parseInt(limit);
+
+    const reels = await reelsCollection.aggregate([
+      {
+        $addFields: {
+          engagementScore: {
+            $add: [
+              { $size: "$likes" },
+              { $size: "$comments" },
+              { $multiply: ["$shares", 2] },
+              "$views"
+            ]
+          }
+        }
+      },
+      { $sort: { engagementScore: -1, createdAt: -1 } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "user",
+        },
+      },
+      { $unwind: "$user" },
+      {
+        $lookup: {
+          from: "videos",
+          localField: "videoId",
+          foreignField: "_id",
+          as: "video",
+        },
+      },
+      { $unwind: "$video" },
+      {
+        $project: {
+          "user.password": 0,
+          "user.email": 0,
+        },
+      },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ]).toArray();
+
+    res.send({
+      success: true,
+      reels,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching trending reels:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while fetching trending reels",
+      error: error.message,
+    });
+  }
+});
+
+// Like/Unlike Reel
+app.post("/reels/:id/like", VerifyToken, async (req, res) => {
+  try {
+    const reelId = req.params.id;
+    const userId = req.user.userId;
+
+    const reel = await reelsCollection.findOne({
+      _id: new ObjectId(reelId),
+    });
+
+    if (!reel) {
+      return res.status(404).send({ message: "Reel not found" });
+    }
+
+    const hasLiked = reel.likes.some(
+      (like) => like.userId.toString() === userId
+    );
+
+    if (hasLiked) {
+      // Unlike
+      await reelsCollection.updateOne(
+        { _id: new ObjectId(reelId) },
+        { $pull: { likes: { userId: new ObjectId(userId) } } }
+      );
+      
+      res.send({ success: true, message: "Reel unliked", liked: false });
+    } else {
+      // Like
+      await reelsCollection.updateOne(
+        { _id: new ObjectId(reelId) },
+        {
+          $push: {
+            likes: {
+              userId: new ObjectId(userId),
+              likedAt: new Date(),
+            },
+          },
+        }
+      );
+
+      // Create notification for reel owner (unless it's their own reel)
+      if (reel.userId.toString() !== userId) {
+        await createNotification({
+          type: NOTIFICATION_TYPES.REEL_LIKE,
+          senderId: new ObjectId(userId),
+          recipientId: reel.userId,
+          message: "liked your reel",
+          metadata: {
+            reelId: new ObjectId(reelId),
+          }
+        });
+      }
+
+      res.send({ success: true, message: "Reel liked", liked: true });
+    }
+  } catch (error) {
+    console.error("Error in reel like endpoint:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Add Comment to Reel
+app.post("/reels/:id/comment", VerifyToken, async (req, res) => {
+  try {
+    const reelId = req.params.id;
+    const userId = req.user.userId;
+    const { content } = req.body;
+
+    if (!content) {
+      return res.status(400).send({ message: "Comment content is required" });
+    }
+
+    const comment = {
+      _id: new ObjectId(),
+      userId: new ObjectId(userId),
+      content,
+      likes: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    await reelsCollection.updateOne(
+      { _id: new ObjectId(reelId) },
+      { $push: { comments: comment } }
+    );
+
+    // Get user details for the comment
+    const user = await usersCollection.findOne(
+      { _id: new ObjectId(userId) },
+      { projection: { name: 1, profilePicture: 1 } }
+    );
+
+    // Get reel details for notification
+    const reel = await reelsCollection.findOne(
+      { _id: new ObjectId(reelId) },
+      { projection: { userId: 1 } }
+    );
+
+    // Create notification (unless commenting on own reel)
+    if (reel.userId.toString() !== userId) {
+      await createNotification({
+        type: NOTIFICATION_TYPES.REEL_COMMENT,
+        senderId: new ObjectId(userId),
+        recipientId: reel.userId,
+        message: "commented on your reel",
+        metadata: {
+          reelId: new ObjectId(reelId),
+          commentId: comment._id,
+        }
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Comment added successfully",
+      comment: {
+        ...comment,
+        user: {
+          name: user.name,
+          profilePicture: user.profilePicture,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Error in reel comment endpoint:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Increment Reel Views
+app.post("/reels/:id/view", VerifyToken, async (req, res) => {
+  try {
+    const reelId = req.params.id;
+
+    await reelsCollection.updateOne(
+      { _id: new ObjectId(reelId) },
+      { $inc: { views: 1 } }
+    );
+
+    res.send({
+      success: true,
+      message: "View counted",
+    });
+  } catch (error) {
+    console.error("Error incrementing reel view:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Get User's Videos
+app.get("/users/:userId/videos", VerifyToken, async (req, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (page - 1) * parseInt(limit);
+
+    const videos = await videosCollection.aggregate([
+      { 
+        $match: { 
+          userId: new ObjectId(targetUserId),
+          privacy: "public"
+        } 
+      },
+      { $sort: { createdAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ]).toArray();
+
+    res.send({
+      success: true,
+      videos,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: await videosCollection.countDocuments({ 
+          userId: new ObjectId(targetUserId),
+          privacy: "public"
+        }),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching user videos:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while fetching user videos",
+      error: error.message,
+    });
+  }
+});
+
+// Get User's Reels
+app.get("/users/:userId/reels", VerifyToken, async (req, res) => {
+  try {
+    const targetUserId = req.params.userId;
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (page - 1) * parseInt(limit);
+
+    const reels = await reelsCollection.aggregate([
+      { 
+        $match: { 
+          userId: new ObjectId(targetUserId)
+        } 
+      },
+      {
+        $lookup: {
+          from: "videos",
+          localField: "videoId",
+          foreignField: "_id",
+          as: "video",
+        },
+      },
+      { $unwind: "$video" },
+      { $sort: { createdAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ]).toArray();
+
+    res.send({
+      success: true,
+      reels,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: await reelsCollection.countDocuments({ 
+          userId: new ObjectId(targetUserId)
+        }),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching user reels:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while fetching user reels",
+      error: error.message,
+    });
+  }
+});
+
+// Delete Video
+app.delete("/videos/:id", VerifyToken, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+    const userId = req.user.userId;
+
+    // Check if video exists and user owns it
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!video) {
+      return res.status(404).send({ message: "Video not found or unauthorized" });
+    }
+
+    // Also delete any reels associated with this video
+    await reelsCollection.deleteMany({
+      videoId: new ObjectId(videoId),
+    });
+
+    await videosCollection.deleteOne({ _id: new ObjectId(videoId) });
+
+    res.send({
+      success: true,
+      message: "Video and associated reels deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting video:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Delete Reel
+app.delete("/reels/:id", VerifyToken, async (req, res) => {
+  try {
+    const reelId = req.params.id;
+    const userId = req.user.userId;
+
+    // Check if reel exists and user owns it
+    const reel = await reelsCollection.findOne({
+      _id: new ObjectId(reelId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!reel) {
+      return res.status(404).send({ message: "Reel not found or unauthorized" });
+    }
+
+    await reelsCollection.deleteOne({ _id: new ObjectId(reelId) });
+
+    res.send({
+      success: true,
+      message: "Reel deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting reel:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Update video privacy
+app.put("/videos/:id/privacy", VerifyToken, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+    const userId = req.user.userId;
+    const { privacy } = req.body;
+
+    if (!privacy || !['public', 'friends', 'private'].includes(privacy)) {
+      return res.status(400).send({ message: "Invalid privacy setting" });
+    }
+
+    // Check if video exists and user owns it
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!video) {
+      return res.status(404).send({ message: "Video not found or unauthorized" });
+    }
+
+    await videosCollection.updateOne(
+      { _id: new ObjectId(videoId) },
+      { $set: { privacy, updatedAt: new Date() } }
+    );
+
+    res.send({
+      success: true,
+      message: `Video privacy updated to ${privacy}`,
+    });
+  } catch (error) {
+    console.error("Error updating video privacy:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+
+// Get video analytics
+app.get("/videos/:id/analytics", VerifyToken, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+    const userId = req.user.userId;
+
+    // Check if video exists and user owns it
+    const video = await videosCollection.findOne({
+      _id: new ObjectId(videoId),
+      userId: new ObjectId(userId),
+    });
+
+    if (!video) {
+      return res.status(404).send({ message: "Video not found or unauthorized" });
+    }
+
+    // Get reels that use this video
+    const reels = await reelsCollection.find({
+      videoId: new ObjectId(videoId)
+    }).toArray();
+
+    const totalReelViews = reels.reduce((sum, reel) => sum + (reel.views || 0), 0);
+    const totalReelLikes = reels.reduce((sum, reel) => sum + (reel.likes?.length || 0), 0);
+    const totalReelComments = reels.reduce((sum, reel) => sum + (reel.comments?.length || 0), 0);
+
+    const analytics = {
+      video: {
+        views: video.views || 0,
+        likes: video.likes?.length || 0,
+        comments: video.comments?.length || 0,
+        shares: video.shares || 0,
+      },
+      reels: {
+        count: reels.length,
+        totalViews: totalReelViews,
+        totalLikes: totalReelLikes,
+        totalComments: totalReelComments,
+        averageEngagement: reels.length > 0 ? (totalReelLikes + totalReelComments) / reels.length : 0
+      }
+    };
+
+    res.send({
+      success: true,
+      analytics,
+    });
+  } catch (error) {
+    console.error("Error fetching video analytics:", error);
+    res.status(500).send({ message: "Server error", error: error.message });
+  }
+});
+app.post("/logout", VerifyToken, (req, res) => {
       res.clearCookie("token");
       res.send({ message: "Logged out Successfully" });
     });
@@ -2908,12 +4383,51 @@ async function run() {
 run().catch(console.dir);
 
 app.get("/", async (req, res) => {
-  res.send("Social Media API Server is running with WebSocket!");
+  res.send(`
+    <html>
+      <head>
+        <title>Social Media API Server</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; }
+          .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+          .online { background: #d4edda; color: #155724; }
+          .info { background: #d1ecf1; color: #0c5460; }
+        </style>
+      </head>
+      <body>
+        <h1>Social Media API Server is running! 🚀</h1>
+        <div class="status online">
+          <strong>WebSocket Status:</strong> Active with Call Support
+        </div>
+        <div class="status info">
+          <strong>Active Calls:</strong> ${activeCalls.size} | 
+          <strong>Online Users:</strong> ${activeUsers.size}
+        </div>
+        <p>Server is ready for audio/video calls and real-time messaging.</p>
+        <h3>Available Features:</h3>
+        <ul>
+          <li>✅ Real-time messaging</li>
+          <li>✅ Audio calls</li>
+          <li>✅ Video calls</li>
+          <li>✅ Notifications</li>
+          <li>✅ User status</li>
+          <li>✅ WebRTC signaling</li>
+        </ul>
+      </body>
+    </html>
+  `);
 });
 
 // Use server.listen instead of app.listen
 server.listen(port, () => {
-  console.log(`Server is running on port: ${port}`);
-  console.log(`WebSocket server is also running on port: ${port}`);
-  console.log(`Real-time notifications are enabled via WebSocket`);
+  console.log(`🚀 Server is running on port: ${port}`);
+  console.log(`🔌 WebSocket server is also running on port: ${port}`);
+  console.log(`📞 Audio/Video Call support: ENABLED`);
+  console.log(`💬 Real-time messaging: ENABLED`);
+  console.log(`🔔 Notifications: ENABLED`);
+  console.log(`🌐 CORS enabled for: http://localhost:8081, http://localhost:19006, http://localhost:3000`);
+  console.log(`\n📊 Initial Status:`);
+  console.log(`   Active Calls: ${activeCalls.size}`);
+  console.log(`   Online Users: ${activeUsers.size}`);
+  console.log(`   Database: Connected`);
 });
