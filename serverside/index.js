@@ -10,6 +10,9 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const http = require('http');
 const { Server } = require('socket.io');
+const FormData = require('form-data');
+const fs = require('fs');
+const fetch = require('node-fetch');
 
 // Create HTTP server and Socket.IO instance
 const server = http.createServer(app);
@@ -62,7 +65,7 @@ const activeUsers = new Map(); // userId -> socketId
 const userSockets = new Map(); // socketId -> userId
 const activeCalls = new Map(); // callId -> call data
 
-let usersCollection, postsCollection,reelsCollection, videosCollection, storiesCollection, friendsCollection, notificationsCollection, conversationsCollection, messagesCollection;
+let usersCollection, postsCollection, storiesCollection, friendsCollection, notificationsCollection, conversationsCollection, messagesCollection, videosCollection;
 
 // Notification Types
 const NOTIFICATION_TYPES = {
@@ -76,10 +79,14 @@ const NOTIFICATION_TYPES = {
   TAG: 'tag',
   INCOMING_CALL: 'incoming_call',
   MISSED_CALL: 'missed_call',
-  NEW_VIDEO: 'new_video',
-  REEL_LIKE: 'reel_like',
-  REEL_COMMENT: 'reel_comment',
-  REEL_SHARE: 'reel_share'
+  NEW_VIDEO: 'new_video'
+};
+
+// Streamable Configuration
+const STREAMABLE_CONFIG = {
+  email: process.env.STREAMABLE_EMAIL,
+  password: process.env.STREAMABLE_PASSWORD,
+  baseUrl: 'https://api.streamable.com'
 };
 
 // Enhanced Create a notification (utility function) with WebSocket support
@@ -253,9 +260,6 @@ async function createCallRecord(callData) {
       updatedAt: new Date()
     };
 
-    // If you have a calls collection, insert it here
-    // await callsCollection.insertOne(callRecord);
-    
     return callRecord;
   } catch (error) {
     console.error('Error creating call record:', error);
@@ -266,14 +270,87 @@ async function createCallRecord(callData) {
 // Helper function to update call record
 async function updateCallRecord(callId, updateData) {
   try {
-    // If you have a calls collection, update it here
-    // await callsCollection.updateOne(
-    //   { callId: callId },
-    //   { $set: updateData }
-    // );
     console.log(`Call ${callId} updated:`, updateData);
   } catch (error) {
     console.error('Error updating call record:', error);
+  }
+}
+
+// Streamable Video Upload Functions
+async function uploadToStreamable(videoBuffer, filename, title = '') {
+  try {
+    const formData = new FormData();
+    formData.append('file', videoBuffer, {
+      filename: filename,
+      contentType: 'video/mp4'
+    });
+    
+    if (title) {
+      formData.append('title', title);
+    }
+
+    const auth = Buffer.from(`${STREAMABLE_CONFIG.email}:${STREAMABLE_CONFIG.password}`).toString('base64');
+
+    const response = await fetch(`${STREAMABLE_CONFIG.baseUrl}/upload`, {
+      method: 'POST',
+      body: formData,
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        ...formData.getHeaders()
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Streamable API error: ${response.status} ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    
+    if (result.shortcode) {
+      return {
+        success: true,
+        shortcode: result.shortcode,
+        url: `https://streamable.com/${result.shortcode}`,
+        status: result.status,
+        message: 'Video uploaded successfully to Streamable'
+      };
+    } else {
+      throw new Error(result.message || 'Upload failed');
+    }
+  } catch (error) {
+    console.error('Error uploading to Streamable:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
+
+async function getStreamableVideoStatus(shortcode) {
+  try {
+    const auth = Buffer.from(`${STREAMABLE_CONFIG.email}:${STREAMABLE_CONFIG.password}`).toString('base64');
+    
+    const response = await fetch(`${STREAMABLE_CONFIG.baseUrl}/videos/${shortcode}`, {
+      headers: {
+        'Authorization': `Basic ${auth}`
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Streamable API error: ${response.status} ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    return {
+      success: true,
+      data: result
+    };
+  } catch (error) {
+    console.error('Error getting Streamable video status:', error);
+    return {
+      success: false,
+      error: error.message
+    };
   }
 }
 
@@ -1008,16 +1085,514 @@ async function run() {
     notificationsCollection = database.collection("notifications");
     conversationsCollection = database.collection("conversations");
     messagesCollection = database.collection("messages");
-    reelsCollection = database.collection("reels");
-    videosCollection = database.collection("videos");
+    videosCollection = database.collection("videos"); // For storing video metadata
+    
     console.log("Database collections initialized successfully");
 
     // Initialize WebSocket handlers after collections are ready
     initializeWebSocketHandlers();
 
-    // Enhanced Notification APIs
+    // **STREAMABLE VIDEO UPLOAD ENDPOINTS**
 
-    // Get all notifications for current user with better filtering
+    // Upload video to Streamable
+    app.post("/upload/video", VerifyToken, async (req, res) => {
+      try {
+        const { video, title, description } = req.body;
+        const userId = req.user.userId;
+
+        if (!video) {
+          return res.status(400).send({
+            success: false,
+            message: "No video data provided",
+          });
+        }
+
+        console.log("Processing video upload to Streamable...");
+
+        // Validate video data
+        if (!video.startsWith("data:video/")) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid video format. Expected base64 video data.",
+          });
+        }
+
+        // Extract base64 data and metadata
+        const videoMatch = video.match(/^data:video\/(\w+);base64,(.+)$/);
+        if (!videoMatch) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid video base64 format",
+          });
+        }
+
+        const videoFormat = videoMatch[1]; // mp4, mov, etc.
+        const base64Data = videoMatch[2];
+        
+        // Convert base64 to buffer
+        const videoBuffer = Buffer.from(base64Data, 'base64');
+        
+        // Calculate video size
+        const videoSizeInBytes = videoBuffer.length;
+
+        // Validate video size (max 250MB for Streamable free tier)
+        if (videoSizeInBytes > 250 * 1024 * 1024) {
+          return res.status(413).send({
+            success: false,
+            message: "Video too large. Maximum size is 250MB for Streamable.",
+          });
+        }
+
+        console.log(`Video details - Format: ${videoFormat}, Size: ${(videoSizeInBytes / 1024 / 1024).toFixed(2)}MB`);
+
+        // Generate filename
+        const filename = `video-${Date.now()}.${videoFormat}`;
+        const videoTitle = title || `Video by user ${userId}`;
+
+        // Upload to Streamable
+        const uploadResult = await uploadToStreamable(videoBuffer, filename, videoTitle);
+
+        if (!uploadResult.success) {
+          throw new Error(uploadResult.error || 'Failed to upload to Streamable');
+        }
+
+        // Store video metadata in database
+        const videoMetadata = {
+          userId: new ObjectId(userId),
+          streamableShortcode: uploadResult.shortcode,
+          streamableUrl: uploadResult.url,
+          title: videoTitle,
+          description: description || "",
+          format: videoFormat,
+          size: videoSizeInBytes,
+          status: 'uploaded',
+          privacy: "public",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await videosCollection.insertOne(videoMetadata);
+
+        // Create notification for followers about new video
+        const followers = await friendsCollection.find({
+          $or: [
+            { requesterId: new ObjectId(userId), status: "accepted" },
+            { recipientId: new ObjectId(userId), status: "accepted" },
+          ],
+        }).toArray();
+
+        const followerIds = followers.map(f => 
+          f.requesterId.toString() === userId ? f.recipientId : f.requesterId
+        );
+
+        // Create notifications for followers
+        for (const followerId of followerIds) {
+          await createNotification({
+            type: NOTIFICATION_TYPES.NEW_VIDEO,
+            senderId: new ObjectId(userId),
+            recipientId: followerId,
+            message: "uploaded a new video",
+            metadata: {
+              videoId: result.insertedId,
+              streamableShortcode: uploadResult.shortcode,
+              streamableUrl: uploadResult.url,
+            }
+          });
+        }
+
+        res.status(200).send({
+          success: true,
+          message: "Video uploaded successfully to Streamable",
+          video: {
+            id: result.insertedId,
+            shortcode: uploadResult.shortcode,
+            url: uploadResult.url,
+            title: videoTitle,
+            size: videoSizeInBytes,
+            format: videoFormat,
+            status: uploadResult.status
+          },
+        });
+      } catch (error) {
+        console.error("Error uploading video to Streamable:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error during video upload",
+          error: error.message,
+        });
+      }
+    });
+
+    // Upload video from URL to Streamable
+    app.post("/upload/video/url", VerifyToken, async (req, res) => {
+      try {
+        const { videoUrl, title, description } = req.body;
+        const userId = req.user.userId;
+
+        if (!videoUrl) {
+          return res.status(400).send({
+            success: false,
+            message: "No video URL provided",
+          });
+        }
+
+        console.log("Importing video from URL to Streamable:", videoUrl);
+
+        const formData = new FormData();
+        formData.append('url', videoUrl);
+        
+        if (title) {
+          formData.append('title', title);
+        }
+
+        const auth = Buffer.from(`${STREAMABLE_CONFIG.email}:${STREAMABLE_CONFIG.password}`).toString('base64');
+
+        const response = await fetch(`${STREAMABLE_CONFIG.baseUrl}/import`, {
+          method: 'POST',
+          body: formData,
+          headers: {
+            'Authorization': `Basic ${auth}`,
+            ...formData.getHeaders()
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`Streamable API error: ${response.status} ${response.statusText}`);
+        }
+
+        const result = await response.json();
+
+        if (result.shortcode) {
+          // Store video metadata in database
+          const videoMetadata = {
+            userId: new ObjectId(userId),
+            streamableShortcode: result.shortcode,
+            streamableUrl: `https://streamable.com/${result.shortcode}`,
+            title: title || `Video by user ${userId}`,
+            description: description || "",
+            sourceUrl: videoUrl,
+            status: 'importing',
+            privacy: "public",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const dbResult = await videosCollection.insertOne(videoMetadata);
+
+          res.status(200).send({
+            success: true,
+            message: "Video import started successfully",
+            video: {
+              id: dbResult.insertedId,
+              shortcode: result.shortcode,
+              url: `https://streamable.com/${result.shortcode}`,
+              title: title,
+              status: result.status
+            },
+          });
+        } else {
+          throw new Error(result.message || 'Import failed');
+        }
+      } catch (error) {
+        console.error("Error importing video to Streamable:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error during video import",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get Streamable video status
+    app.get("/video/:shortcode/status", VerifyToken, async (req, res) => {
+      try {
+        const { shortcode } = req.params;
+
+        const statusResult = await getStreamableVideoStatus(shortcode);
+
+        if (!statusResult.success) {
+          return res.status(404).send({
+            success: false,
+            message: "Video not found or error fetching status",
+            error: statusResult.error
+          });
+        }
+
+        res.send({
+          success: true,
+          video: statusResult.data
+        });
+      } catch (error) {
+        console.error("Error getting video status:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get user's uploaded videos
+    app.get("/videos/my", VerifyToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (page - 1) * parseInt(limit);
+
+        const videos = await videosCollection
+          .find({ userId: new ObjectId(userId) })
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await videosCollection.countDocuments({ 
+          userId: new ObjectId(userId) 
+        });
+
+        res.send({
+          success: true,
+          videos,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching user videos:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while fetching videos",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get all public videos
+    app.get("/videos", VerifyToken, async (req, res) => {
+      try {
+        const { page = 1, limit = 10 } = req.query;
+        const skip = (page - 1) * parseInt(limit);
+
+        const videos = await videosCollection
+          .aggregate([
+            { $match: { privacy: "public" } },
+            {
+              $lookup: {
+                from: "users",
+                localField: "userId",
+                foreignField: "_id",
+                as: "user",
+              },
+            },
+            { $unwind: "$user" },
+            {
+              $project: {
+                "user.password": 0,
+                "user.email": 0,
+              },
+            },
+            { $sort: { createdAt: -1 } },
+            { $skip: skip },
+            { $limit: parseInt(limit) },
+          ])
+          .toArray();
+
+        const total = await videosCollection.countDocuments({ 
+          privacy: "public" 
+        });
+
+        res.send({
+          success: true,
+          videos,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total
+          }
+        });
+      } catch (error) {
+        console.error("Error fetching videos:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while fetching videos",
+          error: error.message,
+        });
+      }
+    });
+
+    // Delete video from Streamable
+    app.delete("/video/:shortcode", VerifyToken, async (req, res) => {
+      try {
+        const { shortcode } = req.params;
+        const userId = req.user.userId;
+
+        // First, check if video exists and belongs to user
+        const video = await videosCollection.findOne({ 
+          streamableShortcode: shortcode,
+          userId: new ObjectId(userId)
+        });
+
+        if (!video) {
+          return res.status(404).send({
+            success: false,
+            message: "Video not found or unauthorized"
+          });
+        }
+
+        const auth = Buffer.from(`${STREAMABLE_CONFIG.email}:${STREAMABLE_CONFIG.password}`).toString('base64');
+
+        const response = await fetch(`${STREAMABLE_CONFIG.baseUrl}/videos/${shortcode}`, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Basic ${auth}`
+          }
+        });
+
+        if (response.status === 204) {
+          // Also delete from database
+          await videosCollection.deleteOne({ 
+            streamableShortcode: shortcode,
+            userId: new ObjectId(userId)
+          });
+
+          res.send({
+            success: true,
+            message: "Video deleted successfully from Streamable"
+          });
+        } else {
+          throw new Error('Failed to delete video from Streamable');
+        }
+      } catch (error) {
+        console.error("Error deleting video:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error while deleting video",
+          error: error.message,
+        });
+      }
+    });
+
+app.get("/video/:shortcode/embed", VerifyToken, async (req, res) => {
+      try {
+        const { shortcode } = req.params;
+
+        const statusResult = await getStreamableVideoStatus(shortcode);
+
+        if (!statusResult.success) {
+          return res.status(404).send({
+            success: false,
+            message: "Video not found"
+          });
+        }
+
+        const videoData = statusResult.data;
+
+        res.send({
+          success: true,
+          embed: {
+            shortcode: shortcode,
+            url: `https://streamable.com/${shortcode}`,
+            embedUrl: `https://streamable.com/e/${shortcode}`,
+            thumbnail: videoData.thumbnail_url,
+            title: videoData.title,
+            duration: videoData.duration,
+            files: videoData.files
+          }
+        });
+      } catch (error) {
+        console.error("Error getting video embed info:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+
+    app.put("/video/:shortcode/privacy", VerifyToken, async (req, res) => {
+      try {
+        const { shortcode } = req.params;
+        const userId = req.user.userId;
+        const { privacy } = req.body;
+
+        if (!privacy || !['public', 'private'].includes(privacy)) {
+          return res.status(400).send({
+            success: false,
+            message: "Invalid privacy setting. Use 'public' or 'private'"
+          });
+        }
+
+        const video = await videosCollection.findOne({ 
+          streamableShortcode: shortcode,
+          userId: new ObjectId(userId)
+        });
+
+        if (!video) {
+          return res.status(404).send({
+            success: false,
+            message: "Video not found or unauthorized"
+          });
+        }
+
+        await videosCollection.updateOne(
+          { streamableShortcode: shortcode },
+          { $set: { privacy, updatedAt: new Date() } }
+        );
+
+        res.send({
+          success: true,
+          message: `Video privacy updated to ${privacy}`
+        });
+      } catch (error) {
+        console.error("Error updating video privacy:", error);
+        res.status(500).send({
+          success: false,
+          message: "Server error",
+          error: error.message,
+        });
+      }
+    });
+
+    // Health check for Streamable
+    app.get("/streamable/health", VerifyToken, async (req, res) => {
+      try {
+        // Test Streamable connection by getting account info
+        const auth = Buffer.from(`${STREAMABLE_CONFIG.email}:${STREAMABLE_CONFIG.password}`).toString('base64');
+        
+        const response = await fetch(`${STREAMABLE_CONFIG.baseUrl}/user`, {
+          headers: {
+            'Authorization': `Basic ${auth}`
+          }
+        });
+
+        if (response.ok) {
+          const userData = await response.json();
+          res.send({
+            success: true,
+            message: "Streamable connection successful",
+            account: {
+              username: userData.username,
+              plan: userData.plan,
+              uploadsRemaining: userData.uploads_remaining
+            }
+          });
+        } else {
+          throw new Error('Streamable connection failed');
+        }
+      } catch (error) {
+        console.error("Streamable health check failed:", error);
+        res.status(500).send({
+          success: false,
+          message: "Streamable connection failed",
+          error: error.message,
+        });
+      }
+    });
+
+    // Enhanced Notification APIs
     app.get("/notifications", VerifyToken, async (req, res) => {
       try {
         const userId = req.user.userId;
@@ -1452,22 +2027,6 @@ async function run() {
         const { page = 1, limit = 20 } = req.query;
         const skip = (page - 1) * parseInt(limit);
 
-        // If you have a calls collection, use this:
-        /*
-        const calls = await callsCollection
-          .find({
-            participants: new ObjectId(userId)
-          })
-          .sort({ startedAt: -1 })
-          .skip(skip)
-          .limit(parseInt(limit))
-          .toArray();
-
-        const total = await callsCollection.countDocuments({
-          participants: new ObjectId(userId)
-        });
-        */
-
         // For now, return empty array since we don't have calls collection
         const calls = [];
         const total = 0;
@@ -1576,7 +2135,8 @@ async function run() {
         next();
       });
     }
-app.get("/status", VerifyToken, async (req, res) => {
+
+    app.get("/status", VerifyToken, async (req, res) => {
       try {
         const userId = req.user.userId;
         const isOnline = activeUsers.has(userId);
@@ -1610,7 +2170,6 @@ app.get("/status", VerifyToken, async (req, res) => {
         });
       }
     });
-
 
     app.post("/upload", VerifyToken, async (req, res) => {
       try {
@@ -1702,923 +2261,7 @@ app.get("/status", VerifyToken, async (req, res) => {
       }
     });
 
-app.post("/upload/video", VerifyToken, async (req, res) => {
-  try {
-    const { video, thumbnail, caption, duration, aspectRatio } = req.body;
-    const userId = req.user.userId;
-
-    if (!video) {
-      return res.status(400).send({
-        success: false,
-        message: "No video data provided",
-      });
-    }
-
-    console.log("Processing video upload to MongoDB...");
-
-    // Validate video data
-    if (!video.startsWith("data:video/")) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid video format. Expected base64 video data.",
-      });
-    }
-
-    // Extract base64 data and metadata
-    const videoMatch = video.match(/^data:video\/(\w+);base64,(.+)$/);
-    if (!videoMatch) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid video base64 format",
-      });
-    }
-
-    const videoFormat = videoMatch[1]; // mp4, mov, etc.
-    const base64Data = videoMatch[2];
-    
-    // Calculate video size
-    const videoSizeInBytes = (base64Data.length * 3) / 4;
-
-    // Validate video size (max 50MB for videos)
-    if (videoSizeInBytes > 50 * 1024 * 1024) {
-      return res.status(413).send({
-        success: false,
-        message: "Video too large. Maximum size is 50MB.",
-      });
-    }
-
-    console.log(`Video details - Format: ${videoFormat}, Size: ${(videoSizeInBytes / 1024 / 1024).toFixed(2)}MB`);
-
-    // Handle thumbnail if provided
-    let thumbnailBase64 = null;
-    let thumbnailFormat = null;
-    
-    if (thumbnail && thumbnail.startsWith("data:image/")) {
-      const thumbMatch = thumbnail.match(/^data:image\/(\w+);base64,(.+)$/);
-      if (thumbMatch) {
-        thumbnailFormat = thumbMatch[1];
-        thumbnailBase64 = thumbMatch[2];
-      }
-    }
-
-    // Save video metadata to database with base64 data
-    const videoMetadata = {
-      userId: new ObjectId(userId),
-      videoData: base64Data, // Store base64 video data directly
-      videoFormat: videoFormat,
-      thumbnail: thumbnailBase64, // Store base64 thumbnail data
-      thumbnailFormat: thumbnailFormat,
-      caption: caption || "",
-      duration: duration || 0,
-      aspectRatio: aspectRatio || "9:16",
-      size: videoSizeInBytes,
-      likes: [],
-      comments: [],
-      shares: 0,
-      views: 0,
-      privacy: "public",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await videosCollection.insertOne(videoMetadata);
-
-    // Create notification for followers about new video
-    const followers = await friendsCollection.find({
-      $or: [
-        { requesterId: new ObjectId(userId), status: "accepted" },
-        { recipientId: new ObjectId(userId), status: "accepted" },
-      ],
-    }).toArray();
-
-    const followerIds = followers.map(f => 
-      f.requesterId.toString() === userId ? f.recipientId : f.requesterId
-    );
-
-    // Create notifications for followers
-    for (const followerId of followerIds) {
-      await createNotification({
-        type: NOTIFICATION_TYPES.NEW_VIDEO,
-        senderId: new ObjectId(userId),
-        recipientId: followerId,
-        message: "uploaded a new video",
-        metadata: {
-          videoId: result.insertedId,
-        }
-      });
-    }
-
-    res.status(200).send({
-      success: true,
-      message: "Video uploaded successfully to database",
-      video: {
-        id: result.insertedId,
-        duration,
-        aspectRatio,
-        size: videoSizeInBytes,
-        format: videoFormat,
-      },
-    });
-  } catch (error) {
-    console.error("Error uploading video to database:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error during video upload",
-      error: error.message,
-    });
-  }
-});
-// Stream video from MongoDB
-app.get("/videos/:videoId/stream", VerifyToken, async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    const userId = req.user.userId;
-
-    // Find video in database
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId)
-    });
-
-    if (!video) {
-      return res.status(404).send({
-        success: false,
-        message: "Video not found"
-      });
-    }
-
-    // Check privacy settings
-    if (video.privacy === 'private' && video.userId.toString() !== userId) {
-      return res.status(403).send({
-        success: false,
-        message: "Access denied"
-      });
-    }
-
-    if (video.privacy === 'friends') {
-      const isFriend = await friendsCollection.findOne({
-        $or: [
-          { requesterId: new ObjectId(userId), recipientId: video.userId, status: "accepted" },
-          { requesterId: video.userId, recipientId: new ObjectId(userId), status: "accepted" },
-        ],
-      });
-
-      if (!isFriend && video.userId.toString() !== userId) {
-        return res.status(403).send({
-          success: false,
-          message: "Access denied"
-        });
-      }
-    }
-
-    // Convert base64 back to buffer
-    const videoBuffer = Buffer.from(video.videoData, 'base64');
-    
-    // Set appropriate headers
-    res.setHeader('Content-Type', `video/${video.videoFormat}`);
-    res.setHeader('Content-Length', videoBuffer.length);
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
-
-    // Handle range requests for video streaming
-    const range = req.headers.range;
-    if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : videoBuffer.length - 1;
-      const chunksize = (end - start) + 1;
-
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${videoBuffer.length}`,
-        'Content-Length': chunksize,
-      });
-
-      res.end(videoBuffer.slice(start, end + 1));
-    } else {
-      res.end(videoBuffer);
-    }
-
-    // Increment view count
-    await videosCollection.updateOne(
-      { _id: new ObjectId(videoId) },
-      { $inc: { views: 1 } }
-    );
-
-  } catch (error) {
-    console.error("Error streaming video:", error);
-    res.status(500).send({
-      success: false,
-      message: "Error streaming video",
-      error: error.message
-    });
-  }
-});
-
-
-// Serve thumbnail from MongoDB
-app.get("/videos/:videoId/thumbnail", VerifyToken, async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    const userId = req.user.userId;
-
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId)
-    });
-
-    if (!video || !video.thumbnail) {
-      return res.status(404).send({
-        success: false,
-        message: "Thumbnail not found"
-      });
-    }
-
-    // Check privacy (same logic as video streaming)
-    if (video.privacy === 'private' && video.userId.toString() !== userId) {
-      return res.status(403).send({
-        success: false,
-        message: "Access denied"
-      });
-    }
-
-    if (video.privacy === 'friends') {
-      const isFriend = await friendsCollection.findOne({
-        $or: [
-          { requesterId: new ObjectId(userId), recipientId: video.userId, status: "accepted" },
-          { requesterId: video.userId, recipientId: new ObjectId(userId), status: "accepted" },
-        ],
-      });
-
-      if (!isFriend && video.userId.toString() !== userId) {
-        return res.status(403).send({
-          success: false,
-          message: "Access denied"
-        });
-      }
-    }
-
-    const thumbBuffer = Buffer.from(video.thumbnail, 'base64');
-    
-    res.setHeader('Content-Type', `image/${video.thumbnailFormat || 'jpeg'}`);
-    res.setHeader('Content-Length', thumbBuffer.length);
-    res.setHeader('Cache-Control', 'public, max-age=31536000');
-
-    res.end(thumbBuffer);
-
-  } catch (error) {
-    console.error("Error serving thumbnail:", error);
-    res.status(500).send({
-      success: false,
-      message: "Error serving thumbnail",
-      error: error.message
-    });
-  }
-});
-// Create Reel API
-app.post("/reels", VerifyToken, async (req, res) => {
-  try {
-    const { videoId, caption, music, effects } = req.body;
-    const userId = req.user.userId;
-
-    // Verify video exists and belongs to user
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!video) {
-      return res.status(404).send({
-        success: false,
-        message: "Video not found or unauthorized",
-      });
-    }
-
-    // Create reel
-    const newReel = {
-      userId: new ObjectId(userId),
-      videoId: new ObjectId(videoId),
-      caption: caption || "",
-      music: music || null,
-      effects: effects || [],
-      likes: [],
-      comments: [],
-      shares: 0,
-      views: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await reelsCollection.insertOne(newReel);
-
-    // Get complete reel with user and video data
-    const reel = await reelsCollection.aggregate([
-      { $match: { _id: result.insertedId } },
-      {
-        $lookup: {
-          from: "users",
-          localField: "userId",
-          foreignField: "_id",
-          as: "user",
-        },
-      },
-      { $unwind: "$user" },
-      {
-        $lookup: {
-          from: "videos",
-          localField: "videoId",
-          foreignField: "_id",
-          as: "video",
-        },
-      },
-      { $unwind: "$video" },
-      {
-        $project: {
-          "user.password": 0,
-          "user.email": 0,
-        },
-      },
-    ]).next();
-
-    res.status(201).send({
-      success: true,
-      message: "Reel created successfully",
-      reel,
-    });
-  } catch (error) {
-    console.error("Error creating reel:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error while creating reel",
-      error: error.message,
-    });
-  }
-});
-
-// Get Reels Feed
-// Create Reel API - Updated for MongoDB storage
-app.post("/reels", VerifyToken, async (req, res) => {
-  try {
-    const { videoId, caption, music, effects } = req.body;
-    const userId = req.user.userId;
-
-    // Verify video exists and belongs to user
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!video) {
-      return res.status(404).send({
-        success: false,
-        message: "Video not found or unauthorized",
-      });
-    }
-
-    // Create reel with video URL pointing to our streaming endpoint
-    const newReel = {
-      userId: new ObjectId(userId),
-      videoId: new ObjectId(videoId),
-      videoUrl: `/videos/${videoId}/stream`, // Use our streaming endpoint
-      thumbnailUrl: `/videos/${videoId}/thumbnail`, // Use our thumbnail endpoint
-      caption: caption || "",
-      music: music || null,
-      effects: effects || [],
-      duration: video.duration,
-      aspectRatio: video.aspectRatio,
-      likes: [],
-      comments: [],
-      shares: 0,
-      views: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await reelsCollection.insertOne(newReel);
-
-    // Get complete reel with user and video data
-    const reel = await reelsCollection.aggregate([
-      { $match: { _id: result.insertedId } },
-      {
-        $lookup: {
-          from: "users",
-          localField: "userId",
-          foreignField: "_id",
-          as: "user",
-        },
-      },
-      { $unwind: "$user" },
-      {
-        $lookup: {
-          from: "videos",
-          localField: "videoId",
-          foreignField: "_id",
-          as: "video",
-        },
-      },
-      { $unwind: "$video" },
-      {
-        $project: {
-          "user.password": 0,
-          "user.email": 0,
-          "video.videoData": 0, // Don't send large video data
-          "video.thumbnail": 0, // Don't send thumbnail data
-        },
-      },
-    ]).next();
-
-    res.status(201).send({
-      success: true,
-      message: "Reel created successfully",
-      reel,
-    });
-  } catch (error) {
-    console.error("Error creating reel:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error while creating reel",
-      error: error.message,
-    });
-  }
-});
-// Cleanup old videos (run periodically)
-app.delete("/videos/cleanup", VerifyToken, async (req, res) => {
-  try {
-    const userId = req.user.userId;
-    const { olderThanDays = 30 } = req.body;
-
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
-
-    // Delete videos older than specified days
-    const result = await videosCollection.deleteMany({
-      userId: new ObjectId(userId),
-      createdAt: { $lt: cutoffDate }
-    });
-
-    res.send({
-      success: true,
-      message: `Cleaned up ${result.deletedCount} old videos`,
-      deletedCount: result.deletedCount
-    });
-  } catch (error) {
-    console.error("Error cleaning up videos:", error);
-    res.status(500).send({
-      success: false,
-      message: "Error cleaning up videos",
-      error: error.message
-    });
-  }
-});
-// Get Trending Reels
-app.get("/reels/trending", VerifyToken, async (req, res) => {
-  try {
-    const { page = 1, limit = 10 } = req.query;
-    const skip = (page - 1) * parseInt(limit);
-
-    const reels = await reelsCollection.aggregate([
-      {
-        $addFields: {
-          engagementScore: {
-            $add: [
-              { $size: "$likes" },
-              { $size: "$comments" },
-              { $multiply: ["$shares", 2] },
-              "$views"
-            ]
-          }
-        }
-      },
-      { $sort: { engagementScore: -1, createdAt: -1 } },
-      {
-        $lookup: {
-          from: "users",
-          localField: "userId",
-          foreignField: "_id",
-          as: "user",
-        },
-      },
-      { $unwind: "$user" },
-      {
-        $lookup: {
-          from: "videos",
-          localField: "videoId",
-          foreignField: "_id",
-          as: "video",
-        },
-      },
-      { $unwind: "$video" },
-      {
-        $project: {
-          "user.password": 0,
-          "user.email": 0,
-        },
-      },
-      { $skip: skip },
-      { $limit: parseInt(limit) },
-    ]).toArray();
-
-    res.send({
-      success: true,
-      reels,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-      },
-    });
-  } catch (error) {
-    console.error("Error fetching trending reels:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error while fetching trending reels",
-      error: error.message,
-    });
-  }
-});
-
-// Like/Unlike Reel
-app.post("/reels/:id/like", VerifyToken, async (req, res) => {
-  try {
-    const reelId = req.params.id;
-    const userId = req.user.userId;
-
-    const reel = await reelsCollection.findOne({
-      _id: new ObjectId(reelId),
-    });
-
-    if (!reel) {
-      return res.status(404).send({ message: "Reel not found" });
-    }
-
-    const hasLiked = reel.likes.some(
-      (like) => like.userId.toString() === userId
-    );
-
-    if (hasLiked) {
-      // Unlike
-      await reelsCollection.updateOne(
-        { _id: new ObjectId(reelId) },
-        { $pull: { likes: { userId: new ObjectId(userId) } } }
-      );
-      
-      res.send({ success: true, message: "Reel unliked", liked: false });
-    } else {
-      // Like
-      await reelsCollection.updateOne(
-        { _id: new ObjectId(reelId) },
-        {
-          $push: {
-            likes: {
-              userId: new ObjectId(userId),
-              likedAt: new Date(),
-            },
-          },
-        }
-      );
-
-      // Create notification for reel owner (unless it's their own reel)
-      if (reel.userId.toString() !== userId) {
-        await createNotification({
-          type: NOTIFICATION_TYPES.REEL_LIKE,
-          senderId: new ObjectId(userId),
-          recipientId: reel.userId,
-          message: "liked your reel",
-          metadata: {
-            reelId: new ObjectId(reelId),
-          }
-        });
-      }
-
-      res.send({ success: true, message: "Reel liked", liked: true });
-    }
-  } catch (error) {
-    console.error("Error in reel like endpoint:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Add Comment to Reel
-app.post("/reels/:id/comment", VerifyToken, async (req, res) => {
-  try {
-    const reelId = req.params.id;
-    const userId = req.user.userId;
-    const { content } = req.body;
-
-    if (!content) {
-      return res.status(400).send({ message: "Comment content is required" });
-    }
-
-    const comment = {
-      _id: new ObjectId(),
-      userId: new ObjectId(userId),
-      content,
-      likes: [],
-      createdAt: new Date(),
-      updatedAt: new Date()
-    };
-
-    await reelsCollection.updateOne(
-      { _id: new ObjectId(reelId) },
-      { $push: { comments: comment } }
-    );
-
-    // Get user details for the comment
-    const user = await usersCollection.findOne(
-      { _id: new ObjectId(userId) },
-      { projection: { name: 1, profilePicture: 1 } }
-    );
-
-    // Get reel details for notification
-    const reel = await reelsCollection.findOne(
-      { _id: new ObjectId(reelId) },
-      { projection: { userId: 1 } }
-    );
-
-    // Create notification (unless commenting on own reel)
-    if (reel.userId.toString() !== userId) {
-      await createNotification({
-        type: NOTIFICATION_TYPES.REEL_COMMENT,
-        senderId: new ObjectId(userId),
-        recipientId: reel.userId,
-        message: "commented on your reel",
-        metadata: {
-          reelId: new ObjectId(reelId),
-          commentId: comment._id,
-        }
-      });
-    }
-
-    res.send({
-      success: true,
-      message: "Comment added successfully",
-      comment: {
-        ...comment,
-        user: {
-          name: user.name,
-          profilePicture: user.profilePicture,
-        },
-      },
-    });
-  } catch (error) {
-    console.error("Error in reel comment endpoint:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Increment Reel Views
-app.post("/reels/:id/view", VerifyToken, async (req, res) => {
-  try {
-    const reelId = req.params.id;
-
-    await reelsCollection.updateOne(
-      { _id: new ObjectId(reelId) },
-      { $inc: { views: 1 } }
-    );
-
-    res.send({
-      success: true,
-      message: "View counted",
-    });
-  } catch (error) {
-    console.error("Error incrementing reel view:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Get User's Videos
-app.get("/users/:userId/videos", VerifyToken, async (req, res) => {
-  try {
-    const targetUserId = req.params.userId;
-    const { page = 1, limit = 10 } = req.query;
-    const skip = (page - 1) * parseInt(limit);
-
-    const videos = await videosCollection.aggregate([
-      { 
-        $match: { 
-          userId: new ObjectId(targetUserId),
-          privacy: "public"
-        } 
-      },
-      { $sort: { createdAt: -1 } },
-      { $skip: skip },
-      { $limit: parseInt(limit) },
-    ]).toArray();
-
-    res.send({
-      success: true,
-      videos,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: await videosCollection.countDocuments({ 
-          userId: new ObjectId(targetUserId),
-          privacy: "public"
-        }),
-      },
-    });
-  } catch (error) {
-    console.error("Error fetching user videos:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error while fetching user videos",
-      error: error.message,
-    });
-  }
-});
-
-// Get User's Reels
-app.get("/users/:userId/reels", VerifyToken, async (req, res) => {
-  try {
-    const targetUserId = req.params.userId;
-    const { page = 1, limit = 10 } = req.query;
-    const skip = (page - 1) * parseInt(limit);
-
-    const reels = await reelsCollection.aggregate([
-      { 
-        $match: { 
-          userId: new ObjectId(targetUserId)
-        } 
-      },
-      {
-        $lookup: {
-          from: "videos",
-          localField: "videoId",
-          foreignField: "_id",
-          as: "video",
-        },
-      },
-      { $unwind: "$video" },
-      { $sort: { createdAt: -1 } },
-      { $skip: skip },
-      { $limit: parseInt(limit) },
-    ]).toArray();
-
-    res.send({
-      success: true,
-      reels,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total: await reelsCollection.countDocuments({ 
-          userId: new ObjectId(targetUserId)
-        }),
-      },
-    });
-  } catch (error) {
-    console.error("Error fetching user reels:", error);
-    res.status(500).send({
-      success: false,
-      message: "Server error while fetching user reels",
-      error: error.message,
-    });
-  }
-});
-
-// Delete Video
-app.delete("/videos/:id", VerifyToken, async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    const userId = req.user.userId;
-
-    // Check if video exists and user owns it
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!video) {
-      return res.status(404).send({ message: "Video not found or unauthorized" });
-    }
-
-    // Also delete any reels associated with this video
-    await reelsCollection.deleteMany({
-      videoId: new ObjectId(videoId),
-    });
-
-    await videosCollection.deleteOne({ _id: new ObjectId(videoId) });
-
-    res.send({
-      success: true,
-      message: "Video and associated reels deleted successfully",
-    });
-  } catch (error) {
-    console.error("Error deleting video:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Delete Reel
-app.delete("/reels/:id", VerifyToken, async (req, res) => {
-  try {
-    const reelId = req.params.id;
-    const userId = req.user.userId;
-
-    // Check if reel exists and user owns it
-    const reel = await reelsCollection.findOne({
-      _id: new ObjectId(reelId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!reel) {
-      return res.status(404).send({ message: "Reel not found or unauthorized" });
-    }
-
-    await reelsCollection.deleteOne({ _id: new ObjectId(reelId) });
-
-    res.send({
-      success: true,
-      message: "Reel deleted successfully",
-    });
-  } catch (error) {
-    console.error("Error deleting reel:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Update video privacy
-app.put("/videos/:id/privacy", VerifyToken, async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    const userId = req.user.userId;
-    const { privacy } = req.body;
-
-    if (!privacy || !['public', 'friends', 'private'].includes(privacy)) {
-      return res.status(400).send({ message: "Invalid privacy setting" });
-    }
-
-    // Check if video exists and user owns it
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!video) {
-      return res.status(404).send({ message: "Video not found or unauthorized" });
-    }
-
-    await videosCollection.updateOne(
-      { _id: new ObjectId(videoId) },
-      { $set: { privacy, updatedAt: new Date() } }
-    );
-
-    res.send({
-      success: true,
-      message: `Video privacy updated to ${privacy}`,
-    });
-  } catch (error) {
-    console.error("Error updating video privacy:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-
-// Get video analytics
-app.get("/videos/:id/analytics", VerifyToken, async (req, res) => {
-  try {
-    const videoId = req.params.id;
-    const userId = req.user.userId;
-
-    // Check if video exists and user owns it
-    const video = await videosCollection.findOne({
-      _id: new ObjectId(videoId),
-      userId: new ObjectId(userId),
-    });
-
-    if (!video) {
-      return res.status(404).send({ message: "Video not found or unauthorized" });
-    }
-
-    // Get reels that use this video
-    const reels = await reelsCollection.find({
-      videoId: new ObjectId(videoId)
-    }).toArray();
-
-    const totalReelViews = reels.reduce((sum, reel) => sum + (reel.views || 0), 0);
-    const totalReelLikes = reels.reduce((sum, reel) => sum + (reel.likes?.length || 0), 0);
-    const totalReelComments = reels.reduce((sum, reel) => sum + (reel.comments?.length || 0), 0);
-
-    const analytics = {
-      video: {
-        views: video.views || 0,
-        likes: video.likes?.length || 0,
-        comments: video.comments?.length || 0,
-        shares: video.shares || 0,
-      },
-      reels: {
-        count: reels.length,
-        totalViews: totalReelViews,
-        totalLikes: totalReelLikes,
-        totalComments: totalReelComments,
-        averageEngagement: reels.length > 0 ? (totalReelLikes + totalReelComments) / reels.length : 0
-      }
-    };
-
-    res.send({
-      success: true,
-      analytics,
-    });
-  } catch (error) {
-    console.error("Error fetching video analytics:", error);
-    res.status(500).send({ message: "Server error", error: error.message });
-  }
-});
-app.post("/logout", VerifyToken, (req, res) => {
+    app.post("/logout", VerifyToken, (req, res) => {
       res.clearCookie("token");
       res.send({ message: "Logged out Successfully" });
     });
@@ -2626,7 +2269,7 @@ app.post("/logout", VerifyToken, (req, res) => {
     // User Authentication APIs
     app.post("/signup", async (req, res) => {
       try {
-        const { name, email, password, username } = req.body;
+        const { name,username, email, password  } = req.body;
 
         // Check if user already exists
         const existingUser = await usersCollection.findOne({ email });
@@ -2881,123 +2524,114 @@ app.post("/logout", VerifyToken, (req, res) => {
 
     // Post APIs
     app.post("/posts", VerifyToken, async (req, res) => {
+  try {
+    const { content, image, privacy, location } = req.body;
+    const userId = req.user.userId;
+
+    if (!content && !image) {
+      return res.status(400).send({
+        success: false,
+        message: "Post must contain either content or image",
+      });
+    }
+
+    let imageUrl = "";
+    let imageData = null;
+
+    // Upload base64 image to imgBB
+    if (image && image.startsWith("data:image/")) {
       try {
-        const { content, image, privacy } = req.body;
-        const userId = req.user.userId;
+        console.log("Uploading base64 image to imgBB...");
 
-        // Validate required fields
-        if (!content && !image) {
-          return res.status(400).send({
-            success: false,
-            message: "Post must contain either content or image",
-          });
+        const base64Data = image.split(",")[1];
+
+        const formData = new FormData();
+        formData.append("image", base64Data);
+
+        const imgRes = await axios.post(
+          `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+          formData,
+          { headers: formData.getHeaders(), timeout: 30000 }
+        );
+
+        if (imgRes.data.success) {
+          const d = imgRes.data.data;
+          imageUrl = d.url;
+
+          imageData = {
+            url: d.url,
+            deleteUrl: d.delete_url,
+            imageId: d.id,
+            size: d.size,
+            type: d.image.mime,
+            filename: d.image.filename,
+          };
+
+          console.log("Uploaded:", imageUrl);
         }
-
-        let imageUrl = "";
-        let imageData = null;
-
-        // If image is provided as base64, upload it first
-        if (image && image.startsWith("data:image/")) {
-          console.log("Detected base64 image, uploading to imgBB...");
-
-          try {
-            // Upload directly to imgBB instead of internal endpoint
-            const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
-
-            const formData = new URLSearchParams();
-            formData.append("image", base64Data);
-
-            const imgBBResponse = await axios.post(
-              `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-              formData,
-              {
-                headers: {
-                  "Content-Type": "application/x-www-form-urlencoded",
-                },
-                timeout: 30000,
-              }
-            );
-
-            if (imgBBResponse.data.success) {
-              const imgBBData = imgBBResponse.data.data;
-              imageUrl = imgBBData.url;
-              imageData = {
-                url: imgBBData.url,
-                thumbUrl: imgBBData.thumb?.url || imgBBData.url,
-                mediumUrl: imgBBData.medium?.url || imgBBData.url,
-                deleteUrl: imgBBData.delete_url,
-                imageId: imgBBData.id,
-              };
-              console.log("Image uploaded successfully:", imageUrl);
-            }
-          } catch (uploadError) {
-            console.error("Failed to upload image:", uploadError);
-            // Continue without image if upload fails
-          }
-        } else if (image) {
-          // If it's already a URL, use it directly
-          imageUrl = image;
-        }
-
-        const newPost = {
-          userId: new ObjectId(userId),
-          content: content || "",
-          image: imageUrl,
-          imageData: imageData,
-          privacy,
-          likes: [],
-          comments: [],
-          shares: 0,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-
-        console.log("Creating post with data:", {
-          content: newPost.content,
-          hasImage: !!newPost.image,
-          privacy: newPost.privacy,
-        });
-
-        const result = await postsCollection.insertOne(newPost);
-
-        // Populate user details
-        const post = await postsCollection
-          .aggregate([
-            { $match: { _id: result.insertedId } },
-            {
-              $lookup: {
-                from: "users",
-                localField: "userId",
-                foreignField: "_id",
-                as: "user",
-              },
-            },
-            { $unwind: "$user" },
-            {
-              $project: {
-                "user.password": 0,
-                "user.email": 0,
-              },
-            },
-          ])
-          .toArray();
-
-        console.log("Post created successfully:", post[0]._id);
-
-        res.status(201).send({
-          success: true,
-          message: "Post created successfully",
-          post: post[0],
-        });
-      } catch (error) {
-        console.error("Error creating post:", error);
-        res.status(500).send({
-          success: false,
-          message: "Server error while creating post",
-          error: error.message,
-        });
+      } catch (err) {
+        console.error("Image upload failed:", err.message);
       }
+    }
+
+    // If image is already a URL
+    else if (image) {
+      imageUrl = image;
+    }
+
+    const newPost = {
+      userId: new ObjectId(userId),
+      content: content || "",
+      image: imageUrl,
+      imageData: imageData,
+      location,
+      privacy,
+      likes: [],
+      comments: [],
+      shares: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await postsCollection.insertOne(newPost);
+
+    const post = await postsCollection
+      .aggregate([
+        { $match: { _id: result.insertedId } },
+        {
+          $lookup: {
+            from: "users",
+            localField: "userId",
+            foreignField: "_id",
+            as: "user",
+          },
+        },
+        { $unwind: "$user" },
+        {
+          $project: {
+            "user.password": 0,
+            "user.email": 0,
+          },
+        },
+      ])
+      .toArray();
+
+    res.status(201).send({
+      success: true,
+      message: "Post created",
+      post: post[0],
     });
+  } catch (error) {
+    console.error("Post error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Server error while creating post",
+      error: error.message,
+    });
+  }
+});
+
 
     // Health check endpoint
     app.get("/health", (req, res) => {
@@ -3006,7 +2640,8 @@ app.post("/logout", VerifyToken, (req, res) => {
         message: "Server is running with WebSocket support",
         timestamp: new Date().toISOString(),
         websocket: true,
-        database: "connected"
+        database: "connected",
+        streamable: STREAMABLE_CONFIG.email ? "configured" : "not configured"
       });
     });
 
@@ -3390,7 +3025,111 @@ app.post("/logout", VerifyToken, (req, res) => {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
+// Update user interests
+app.post("/user/interests", VerifyToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { interests } = req.body;
 
+    console.log('🎯 Interests endpoint called');
+    console.log('📤 User ID:', userId);
+    console.log('📦 Received interests:', interests);
+
+    if (!interests || !Array.isArray(interests)) {
+      console.log('❌ Invalid interests data');
+      return res.status(400).send({
+        success: false,
+        message: "Interests array is required",
+      });
+    }
+
+    // Validate interests
+    if (interests.length < 3) {
+      console.log('❌ Not enough interests:', interests.length);
+      return res.status(400).send({
+        success: false,
+        message: "Please select at least 3 interests",
+      });
+    }
+
+    console.log('✅ Valid interests received, updating database...');
+
+    // Update user interests
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(userId) },
+      { 
+        $set: { 
+          interests: interests,
+          hasCompletedInterests: true,
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    console.log('📊 Database update result:', result);
+
+    if (result.modifiedCount === 0) {
+      console.log('❌ User not found in database');
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Get updated user data
+    const updatedUser = await usersCollection.findOne(
+      { _id: new ObjectId(userId) },
+      { projection: { password: 0 } }
+    );
+
+    console.log('✅ Interests updated successfully');
+    console.log('👤 Updated user:', updatedUser);
+
+    res.send({
+      success: true,
+      message: "Interests updated successfully",
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error("❌ Error updating interests:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while updating interests",
+      error: error.message,
+    });
+  }
+});
+// Get user interests (optional - if you need to fetch them)
+app.get("/user/interests", VerifyToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    const user = await usersCollection.findOne(
+      { _id: new ObjectId(userId) },
+      { projection: { interests: 1, hasCompletedInterests: 1 } }
+    );
+
+    if (!user) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      interests: user.interests || [],
+      hasCompletedInterests: user.hasCompletedInterests || false,
+    });
+  } catch (error) {
+    console.error("Error fetching interests:", error);
+    res.status(500).send({
+      success: false,
+      message: "Server error while fetching interests",
+      error: error.message,
+    });
+  }
+});
     // Enhanced Share Post with Notification
     app.post("/posts/:id/share", VerifyToken, async (req, res) => {
       try {
@@ -4392,6 +4131,7 @@ app.get("/", async (req, res) => {
           .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
           .online { background: #d4edda; color: #155724; }
           .info { background: #d1ecf1; color: #0c5460; }
+          .streamable { background: #fff3cd; color: #856404; }
         </style>
       </head>
       <body>
@@ -4399,11 +4139,14 @@ app.get("/", async (req, res) => {
         <div class="status online">
           <strong>WebSocket Status:</strong> Active with Call Support
         </div>
+        <div class="status streamable">
+          <strong>Streamable Video Hosting:</strong> Active
+        </div>
         <div class="status info">
           <strong>Active Calls:</strong> ${activeCalls.size} | 
           <strong>Online Users:</strong> ${activeUsers.size}
         </div>
-        <p>Server is ready for audio/video calls and real-time messaging.</p>
+        <p>Server is ready for audio/video calls, real-time messaging, and video uploads.</p>
         <h3>Available Features:</h3>
         <ul>
           <li>✅ Real-time messaging</li>
@@ -4412,6 +4155,20 @@ app.get("/", async (req, res) => {
           <li>✅ Notifications</li>
           <li>✅ User status</li>
           <li>✅ WebRTC signaling</li>
+          <li>✅ Streamable video uploads</li>
+          <li>✅ Video URL importing</li>
+        </ul>
+        <h3>Streamable Video Endpoints:</h3>
+        <ul>
+          <li><code>POST /upload/video</code> - Upload base64 video</li>
+          <li><code>POST /upload/video/url</code> - Import video from URL</li>
+          <li><code>GET /video/:shortcode/status</code> - Get video status</li>
+          <li><code>GET /video/:shortcode/embed</code> - Get embed info</li>
+          <li><code>DELETE /video/:shortcode</code> - Delete video</li>
+          <li><code>GET /videos/my</code> - Get user's videos</li>
+          <li><code>GET /videos</code> - Get all public videos</li>
+          <li><code>PUT /video/:shortcode/privacy</code> - Update video privacy</li>
+          <li><code>GET /streamable/health</code> - Check Streamable connection</li>
         </ul>
       </body>
     </html>
@@ -4425,9 +4182,11 @@ server.listen(port, () => {
   console.log(`📞 Audio/Video Call support: ENABLED`);
   console.log(`💬 Real-time messaging: ENABLED`);
   console.log(`🔔 Notifications: ENABLED`);
+  console.log(`🎥 Streamable Video Uploads: ENABLED`);
   console.log(`🌐 CORS enabled for: http://localhost:8081, http://localhost:19006, http://localhost:3000`);
   console.log(`\n📊 Initial Status:`);
   console.log(`   Active Calls: ${activeCalls.size}`);
   console.log(`   Online Users: ${activeUsers.size}`);
   console.log(`   Database: Connected`);
+  console.log(`   Streamable: ${STREAMABLE_CONFIG.email ? 'Configured' : 'Not Configured'}`);
 });
