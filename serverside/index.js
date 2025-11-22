@@ -3497,7 +3497,6 @@ app.get("/user/interests", VerifyToken, async (req, res) => {
       }
     });
 
-    // Story APIs
     app.post("/stories", VerifyToken, async (req, res) => {
       try {
         const { image, content } = req.body;
@@ -3525,6 +3524,9 @@ app.get("/user/interests", VerifyToken, async (req, res) => {
         res.status(500).send({ message: "Server error", error: error.message });
       }
     });
+
+
+    
 
     app.get("/stories", VerifyToken, async (req, res) => {
       try {
